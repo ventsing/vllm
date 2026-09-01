@@ -112,6 +112,7 @@ class EngineCore:
         log_stats: bool,
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
+        external_actors: list | None = None,
     ):
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
@@ -131,7 +132,13 @@ class EngineCore:
         self._weight_version = "default"
 
         # Setup Model.
-        self.model_executor = executor_class(vllm_config)
+        # If external_actors is provided, pass it to the executor
+        if external_actors is not None:
+            self.model_executor = executor_class(
+                vllm_config, external_actors=external_actors
+            )
+        else:
+            self.model_executor = executor_class(vllm_config)
         self._pooler_config_logged = False
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
@@ -1040,6 +1047,7 @@ class EngineCoreProc(EngineCore):
         log_stats: bool,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        external_actors: list | None = None,
         *,
         engine_index: int = 0,
     ):
@@ -1096,6 +1104,7 @@ class EngineCoreProc(EngineCore):
                 log_stats,
                 executor_fail_callback,
                 internal_dp_balancing,
+                external_actors=external_actors,
             )
 
             # Initialize fault tolerance settings.

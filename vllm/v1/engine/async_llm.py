@@ -86,6 +86,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        external_actors: list[Any] | None = None,
     ) -> None:
         """
         Create an AsyncLLM.
@@ -102,6 +103,9 @@ class AsyncLLM(EngineClient):
                 If not provided, default stat loggers will be used.
                 PLEASE BE AWARE THAT STAT LOGGER IS NOT STABLE
                 IN V1, AND ITS BASE CLASS INTERFACE MIGHT CHANGE.
+            external_actors: Pre-started Ray Actor handles for ExternalExecutor.
+                If provided, the executor will use these actors instead of
+                creating new ones. Used by ExternalExecutor plugin.
 
         Returns:
             None
@@ -153,6 +157,7 @@ class AsyncLLM(EngineClient):
             client_addresses=client_addresses,
             client_count=client_count,
             client_index=client_index,
+            external_actors=external_actors,
         )
 
         # Loggers.

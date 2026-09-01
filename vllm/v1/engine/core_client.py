@@ -120,6 +120,7 @@ class EngineCoreClient(ABC):
         client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        external_actors: list | None = None,
     ) -> "AsyncMPClient":
         parallel_config = vllm_config.parallel_config
         client_args = (
@@ -129,6 +130,7 @@ class EngineCoreClient(ABC):
             client_addresses,
             client_count,
             client_index,
+            external_actors,
         )
         if parallel_config.data_parallel_size > 1:
             if parallel_config.data_parallel_external_lb:
@@ -520,8 +522,10 @@ class MPClient(EngineCoreClient):
         executor_class: type[Executor],
         log_stats: bool,
         client_addresses: dict[str, Any] | None = None,
+        external_actors: list | None = None,
     ):
         self.vllm_config = vllm_config
+        self.external_actors = external_actors
 
         # ZMQ setup.
         sync_ctx = zmq.Context(io_threads=2)
@@ -607,7 +611,8 @@ class MPClient(EngineCoreClient):
                 ).decode()
 
                 with launch_core_engines(
-                    vllm_config, executor_class, log_stats, addresses
+                    vllm_config, executor_class, log_stats, addresses,
+                    external_actors=self.external_actors,
                 ) as engine_launch:
                     self.resources.coordinator = engine_launch.coordinator
                     self.resources.engine_manager = engine_launch.engine_manager
@@ -987,6 +992,7 @@ class AsyncMPClient(MPClient):
         client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        external_actors: list | None = None,
     ):
         super().__init__(
             asyncio_mode=True,
@@ -994,6 +1000,7 @@ class AsyncMPClient(MPClient):
             executor_class=executor_class,
             log_stats=log_stats,
             client_addresses=client_addresses,
+            external_actors=external_actors,
         )
 
         self.client_count = client_count
