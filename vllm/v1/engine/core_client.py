@@ -138,6 +138,7 @@ class EngineCoreClient(ABC):
         client_count: int = 1,
         client_index: int = 0,
         renderer: BaseRenderer | None = None,
+        external_actors: list | None = None,
     ) -> "AsyncMPClient":
         parallel_config = vllm_config.parallel_config
         client_args = (
@@ -163,6 +164,7 @@ class EngineCoreClient(ABC):
         return AsyncMPClient(
             *client_args,
             renderer=renderer,
+            external_actors=external_actors,
         )
 
     @abstractmethod
@@ -563,9 +565,11 @@ class MPClient(EngineCoreClient):
         log_stats: bool,
         client_addresses: dict[str, Any] | None = None,
         renderer: BaseRenderer | None = None,
+        external_actors: list | None = None,
     ):
         self.vllm_config = vllm_config
         self._renderer: BaseRenderer | None = renderer
+        self.external_actors = external_actors
 
         # ZMQ setup.
         sync_ctx = zmq.Context(io_threads=2)
@@ -654,7 +658,8 @@ class MPClient(EngineCoreClient):
                 ).decode()
 
                 with launch_core_engines(
-                    vllm_config, executor_class, log_stats, addresses
+                    vllm_config, executor_class, log_stats, addresses,
+                    external_actors=self.external_actors,
                 ) as engine_launch:
                     self.resources.coordinator = engine_launch.coordinator
                     self.resources.engine_manager = engine_launch.engine_manager
@@ -1056,6 +1061,7 @@ class AsyncMPClient(MPClient):
         client_count: int = 1,
         client_index: int = 0,
         renderer: BaseRenderer | None = None,
+        external_actors: list | None = None,
     ):
         super().__init__(
             asyncio_mode=True,
@@ -1064,6 +1070,7 @@ class AsyncMPClient(MPClient):
             log_stats=log_stats,
             client_addresses=client_addresses,
             renderer=renderer,
+            external_actors=external_actors,
         )
 
         self.client_count = client_count

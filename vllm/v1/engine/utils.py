@@ -159,6 +159,7 @@ class CoreEngineProcManager:
         log_stats: bool,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        external_actors: list | None = None,
     ):
         self._request_shutdown_timeout = vllm_config.shutdown_timeout
         context = get_mp_context()
@@ -169,6 +170,7 @@ class CoreEngineProcManager:
             "executor_class": executor_class,
             "log_stats": log_stats,
             "tensor_queue": tensor_queue,
+            "external_actors": external_actors,
         }
 
         if client_handshake_address:
@@ -1106,6 +1108,7 @@ def launch_core_engines(
     executor_class: type[Executor],
     log_stats: bool,
     addresses: EngineZmqAddresses,
+    external_actors: list | None = None,
 ) -> Iterator[CoreEngineLaunch]:
     """Launch engine and DP coordinator processes as needed."""
 
@@ -1229,6 +1232,7 @@ def launch_core_engines(
                 start_index=dp_rank,
                 local_start_index=local_start_index or 0,
                 tensor_queue=tensor_queue,
+                external_actors=external_actors,
             )
         else:
             local_engine_manager = None
