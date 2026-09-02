@@ -829,8 +829,11 @@ class StorageCheckpointEngine:
             raise ValueError("No checkpoint path set. Call set_checkpoint() first.")
         
         for name, tensor in self.storage.get_weights(self._current_checkpoint):
-            # Move tensor to target device
-            tensor = tensor.to(self.device)
+            # Move tensor to target device (no-op if already there), so the
+            # consumer can copy_() without an extra transfer. The copy into
+            # parameter storage stays the single GPU memory allocation.
+            if tensor.device != self.device:
+                tensor = tensor.to(self.device)
             yield name, tensor
     
     def set_checkpoint(self, checkpoint_path: str) -> None:

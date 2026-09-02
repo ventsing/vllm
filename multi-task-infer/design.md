@@ -18,9 +18,11 @@ vLLM 的 Executor 体系（UniProcExecutor、MultiprocExecutor、RayExecutorV2�
 |------|------|------|
 | G1 | Actor 池化 | 预启动一组 Ray Actor，绑定设备并预热公共库，按需分配给 vLLM 实例 |
 | G2 | 动态重组 | 支持动态调整 TP/PP 大小，重新分配 Actor 到新的并行组 |
-| G3 | 模型热切换 | 通过 weight_transfer 机制动态加载新模型权重，不重启进程 |
+| G3 | 模型热切换 | 通过 storage 存储加载 / weight_transfer 机制动态加载新模型权重，不重启进程 |
 | G4 | 数据通路复用 | 复用 RayExecutorV2 的 MessageQueue 通信机制，保持性能一致 |
 | G5 | 最小侵入 | 尽量以插件形式实现，减少对 vLLM 核心代码的修改 |
+| G6 | 编译缓存共享 | 通过 CacheManagerActor（独立 Ray Actor）跨节点共享 torch.compile 缓存，避免重复编译 |
+| G7 | 存储权重加载 | 通过 StorageCheckpointEngine 从持久化存储（NFS/Mooncake Store）加载模型权重 |
 
 ## 0.3 术语定义
 
@@ -32,6 +34,12 @@ vLLM 的 Executor 体系（UniProcExecutor、MultiprocExecutor、RayExecutorV2�
 | **Worker Lease** | Executor 从 Pool 中"租用"一组 Actor 的过程 |
 | **Worker Release** | Executor 将 Actor 归还 Pool 的过程 |
 | **weight_transfer** | vLLM 已有的权重热更新机制，支持 NCCL/IPC/sharded_rdt 后端 |
+| **CacheManagerActor** | 独立的 Ray Actor，作为编译缓存的中央管理器，提供 pull/push API 和编译锁协调 |
+| **编译缓存懒加载** | Worker 编译前按需查找缓存的模式：本地缓存 → CacheManagerActor → fallback 自编译 |
+| **编译锁** | CacheManagerActor 提供的互斥机制，防止多个 Worker 重复编译同一缓存 |
+| **混合存储** | 缓存按大小分流：<50MB 走 Ray Object Store，≥50MB 走 NFS（gzip 压缩） |
+| **StorageCheckpointEngine** | 与 verl CheckpointEngineWithCache 接口兼容的存储后端，从 NFS/Mooncake Store 加载权重 |
+| **StorageBackend** | 存储后端的抽象接口，具体实现：NFSStorageBackend、MooncakeStoreBackend |
 
 ---
 
@@ -98,10 +106,50 @@ vLLM 的 Executor 体系（UniProcExecutor、MultiprocExecutor、RayExecutorV2�
 │  + initialize_worker(...)           # 创建 WorkerWrapperBase                     │
 │  + init_device()                    # 初始化分布式环境                            │
 │  + load_model_via_weight_transfer(init_info)  # 通过 weight_transfer 加载模型    │
+│  + load_model_from_storage(path, backend)     # 从存储加载模型 (G7)               │
 │  + initialize_kv_cache(config)      # 初始化 KV Cache                           │
 │  + compile_or_warm_up_model()       # 编译/预热模型                              │
 │  + run() → worker_busy_loop()       # 启动推理循环                               │
 │  + reset()                          # 释放资源，回到 IDLE 状态                    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        CacheManagerActor (新增, @ray.remote)                      │
+│  ─────────────────────────────────────────────                                   │
+│  - _object_registry: dict[str, ObjectRef]   # 小缓存 → Ray Object Store          │
+│  - _compile_locks: dict[str, dict]          # 编译锁表                            │
+│  - _metadata: dict[str, dict]               # 缓存元数据                          │
+│  - shared_cache_dir: str | None             # 大缓存 → NFS                        │
+│  ─────────────────────────────────────────────                                   │
+│  + pull(hash_key) → bytes | None            # 拉取缓存 (Object Store → NFS)       │
+│  + push(hash_key, data, source) → bool      # 推送缓存 (按大小自动分流)           │
+│  + try_acquire_compile_lock(hash, worker_id) → dict  # 获取编译锁                 │
+│  + release_compile_lock(hash, worker_id)              # 释放编译锁                │
+│  + get_cache_hash(model_cfg, parallel_cfg, comp_cfg)   # 计算缓存哈希 (远端)      │
+│  + get_stats() / list_caches()             # 监控                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      StorageCheckpointEngine (新增)                               │
+│  ─────────────────────────────────────────────                                   │
+│  (兼容 verl CheckpointEngineWithCache 接口)                                      │
+│  - storage: StorageBackend                    # 具体后端                          │
+│  - bucket_size: int                                                              │
+│  - device: str                                                                   │
+│  ─────────────────────────────────────────────                                   │
+│  + prepare() → dict                          # no-op (存储不需要通信拓扑)          │
+│  + build_topology(...)                       # no-op                              │
+│  + init_process_group(**kwargs)              # no-op                              │
+│  + finalize()                                # no-op                              │
+│  + send_weights(gen, global_steps)           # 保存权重到存储 (G7)                │
+│  + receive_weights(global_steps)             # 从存储接收权重                      │
+│  + get_weights() → gen[(name, tensor)]       # 从存储流式获取权重                  │
+│  + set_checkpoint(path)                      # 设置 checkpoint 路径               │
+│  + exists(path) / load_metadata(path) / delete(path)                             │
+│  ─────────────────────────────────────────────                                   │
+│  StorageBackend (抽象)                                                           │
+│  ├── NFSStorageBackend        # safetensors + metadata.json                      │
+│  └── MooncakeStoreBackend     # MooncakeDistributedStore (RDMA)                  │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -122,16 +170,27 @@ vLLM 的 Executor 体系（UniProcExecutor、MultiprocExecutor、RayExecutorV2�
 │  │  - monitor()       │  │  - sample_tokens   │  │  - finish_weight_update   │ │
 │  └────────────────────┘  └────────────────────┘  └────────────────────────────┘ │
 │                                                                                  │
-│  ┌────────────────────┐  ┌────────────────────┐                                 │
-│  │  Worker 适配层      │  │  通信层 (复用)      │                                 │
-│  │  ────────────────  │  │  ────────────────  │                                 │
-│  │                    │  │                    │                                 │
-│  │  ExternalWorker    │  │  MessageQueue      │                                 │
-│  │  Actor             │  │  - rpc_broadcast   │                                 │
-│  │  - init_device()   │  │  - response_mqs    │                                 │
-│  │  - load_model()    │  │  - SHM (同节点)     │                                 │
-│  │  - run()           │  │  - TCP (跨节点)     │                                 │
-│  └────────────────────┘  └────────────────────┘                                 │
+│  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────────┐ │
+│  │ 缓存管理 (G6)       │  │ 存储加载 (G7)       │  │  Worker 适配层             │ │
+│  │  ────────────────  │  │  ────────────────  │  │  ────────────────────────  │ │
+│  │                    │  │                    │  │                            │ │
+│  │  CacheManagerActor │  │  StorageCheckpoint │  │  ExternalWorkerActor      │ │
+│  │  - pull/push       │  │    Engine          │  │  - init_device()          │ │
+│  │  - 编译锁          │  │  - NFS Backend     │  │  - load_model()           │ │
+│  │  - 懒加载协调      │  │  - Mooncake Backend│  │  - load_model_from_       │ │
+│  │                    │  │  - get_weights     │  │    storage()              │ │
+│  │                    │  │  - send_weights    │  │  - run()                  │ │
+│  └────────────────────┘  └────────────────────┘  └────────────────────────────┘ │
+│                                                                                  │
+│  ┌────────────────────┐                                                         │
+│  │  通信层 (复用)      │                                                         │
+│  │  ────────────────  │                                                         │
+│  │  MessageQueue      │                                                         │
+│  │  - rpc_broadcast   │                                                         │
+│  │  - response_mqs    │                                                         │
+│  │  - SHM (同节点)     │                                                         │
+│  │  - TCP (跨节点)     │                                                         │
+│  └────────────────────┘                                                         │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -190,6 +249,90 @@ class ExternalExecutor(RayExecutorV2):
         """释放 Actor 回池"""
 ```
 
+### 1.3.3 CacheManagerActor 接口
+
+```python
+class CacheManagerActor:
+    """编译缓存中央管理器（独立 Ray Actor）"""
+    
+    RAY_OBJECT_THRESHOLD = 50 * 1024 * 1024  # 小缓存阈值: 50 MB
+    
+    def pull(self, hash_key: str) -> bytes | None:
+        """拉取缓存。先查 Ray Object Store，再查 NFS。
+        返回 tar.gz 字节数据，未命中返回 None。"""
+    
+    def push(self, hash_key: str, cache_data: bytes, source: str) -> bool:
+        """推送缓存。≤阈值存入 Ray Object Store，>阈值压缩后写 NFS。"""
+    
+    def try_acquire_compile_lock(self, hash_key: str, worker_id: str) -> dict:
+        """尝试获取编译锁。
+        返回状态: {"status": "acquired" | "wait" | "done", "holder": str}"""
+    
+    def release_compile_lock(self, hash_key: str, worker_id: str) -> None:
+        """释放编译锁（仅锁持有者）。"""
+    
+    def get_cache_hash(
+        self, model_config: dict, parallel_config: dict, compilation_config: dict
+    ) -> str:
+        """远端计算缓存哈希（与 ExternalExecutor._compute_cache_hash 因子一致）。"""
+```
+
+### 1.3.4 StorageCheckpointEngine / StorageBackend 接口
+
+```python
+class StorageCheckpointEngine:
+    """存储后端 checkpoint engine，兼容 verl CheckpointEngineWithCache。"""
+    
+    wire_format = "named_tensors"  # (name, tensor) 流
+        
+    def prepare(self) -> dict[str, Any]: ...
+    def build_topology(cls, *args, **kwargs) -> tuple[dict, dict]: ...
+    def init_process_group(self, **kwargs) -> None: ...
+    def finalize(self) -> None: ...
+    
+    async def send_weights(
+        self, weights: Generator[tuple[str, torch.Tensor], None, None],
+        global_steps: int | None = None,
+    ) -> None:
+        """保存权重到存储。"""
+    
+    async def receive_weights(
+        self, global_steps: int | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """从存储接收权重。"""
+    
+    def get_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """从存储流式获取权重（主路径，用于模型加载）。"""
+    
+    def set_checkpoint(self, checkpoint_path: str) -> None: ...
+    def exists(self, checkpoint_path: str) -> bool: ...
+    def load_metadata(self, checkpoint_path: str) -> CheckpointMetadata: ...
+    def delete(self, checkpoint_path: str) -> None: ...
+
+
+class StorageBackend(ABC):
+    """存储后端抽象接口。"""
+    
+    def initialize(self, config: dict[str, Any]) -> None: ...
+    def save_checkpoint(
+        self, path: str, weights: Generator, metadata: dict | None
+    ) -> str: ...
+    def load_metadata(self, path: str) -> CheckpointMetadata: ...
+    def load_tensor(self, tensor_meta: TensorMeta) -> torch.Tensor: ...
+    def get_weights(self, path: str) -> Generator: ...
+    def exists(self, path: str) -> bool: ...
+    def delete(self, path: str) -> None: ...
+
+
+class NFSStorageBackend(StorageBackend):
+    """NFS 后端: safetensors + metadata.json，无额外服务依赖。"""
+
+
+class MooncakeStoreBackend(StorageBackend):
+    """Mooncake 后端: MooncakeDistributedStore (RDMA ~9 GB/s on IB)。
+    Key 约定: ckpt:{path}:metadata / ckpt:{path}:tensor:{name}"""
+```
+
 ---
 
 # 2. 进程视图（Process View）
@@ -220,6 +363,34 @@ class ExternalExecutor(RayExecutorV2):
 │        │                              │ Worker N   │                            │
 │        │                              │ (Actor)    │                            │
 │        │                              └────────────┘                            │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+CacheManagerActor 作为**独立的 Ray Actor** 常驻集群，与 EngineCore/Worker 并列：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         缓存管理进程拓扑                                          │
+│                                                                                  │
+│                    ┌──────────────────────────────┐                             │
+│                    │  CacheManagerActor           │                             │
+│                    │  (独立 Ray Actor, 持久常驻)   │                             │
+│                    │  ────────────────────────    │                             │
+│                    │  - _object_registry          │  ←→ Ray Object Store        │
+│                    │  - _compile_locks            │                              │
+│                    │  - _metadata                 │                              │
+│                    │  - shared_cache_dir          │  ←→ NFS (大缓存, 压缩)       │
+│                    └──────────────────────────────┘                             │
+│                              ▲              ▲                                    │
+│                    pull/push │              │ 编译锁                              │
+│                    (Ray 调用) │              │ (Ray 调用)                         │
+│                              │              │                                    │
+│        ┌─────────────────────┴─────┐  ┌─────┴─────────────────────┐              │
+│        │  EngineCore (调度进程)     │  │  ExternalWorkerActor     │              │
+│        │  ExternalExecutor         │  │  (每 GPU 一个)            │              │
+│        │  - 懒加载协调              │  │  - 本地缓存检查           │              │
+│        │  - 计算 cache_hash        │  │  - compile_or_warm_up     │              │
+│        └───────────────────────────┘  └───────────────────────────┘              │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -401,6 +572,71 @@ ActorPoolManager    ExternalExecutor    ExternalWorkerActor
        │                   │                    │
 ```
 
+### 2.3.5 编译缓存懒加载阶段（G6）
+
+```
+Worker(Executor)            本地 ~/.cache/vllm           CacheManagerActor          NFS / Object Store
+      │                            │                          │                          │
+      │ _handle_compilation_       │                          │                          │
+      │   _optimization()          │                          │                          │
+      │───────────────────────────→│                          │                          │
+      │                            │                          │                          │
+      │ ① 检查本地缓存             │                          │                          │
+      │  local_cache_exists(hash)  │                          │                          │
+      │───────────────────────────→│                          │                          │
+      │      ← 命中: 跳过编译 ─────│                          │                          │
+      │   (未命中)                  │                          │                          │
+      │                            │                          │                          │
+      │ ② pull(hash_key)           │                          │                          │
+      │───────────────────────────────────────────────────────→│                          │
+      │                            │                          │ 查 Object Store / NFS    │
+      │                            │                          │─────────────────────────→│
+      │                            │                          │← 未命中 (None) ──────────│
+      │      ← 未命中 ────────────────────────────────────────│                          │
+      │                            │                          │                          │
+      │ ③ try_acquire_compile_lock │                          │                          │
+      │───────────────────────────────────────────────────────→│                          │
+      │      ← {"status":"acquired"} ─────────────────────────│                          │
+      │                            │                          │                          │
+      │ ④ collective_rpc("compile_or_warm_up_model")          │                          │
+      │───────────────────────────→ Worker 编译                │                          │
+      │                            │                          │                          │
+      │ ⑤ package_local_cache →    │                          │                          │
+      │    push(hash, data)        │                          │                          │
+      │───────────────────────────────────────────────────────→│ 按大小分流存储           │
+      │                            │                          │─────────────────────────→│
+      │ ⑥ release_compile_lock     │                          │                          │
+      │───────────────────────────────────────────────────────→│                          │
+      │                            │                          │                          │
+      │ (其他 Worker: status="wait" → sleep(5) → 再 pull)      │                          │
+      │ (其他 Worker: status="done" → 直接 pull)               │                          │
+```
+
+### 2.3.6 存储权重加载阶段（G7）
+
+```
+ExternalWorkerActor    StorageCheckpointEngine    StorageBackend (NFS/Mooncake)
+      │                          │                          │
+      │ load_model_from_storage( │                          │
+      │   checkpoint, backend)   │                          │
+      │─────────────────────────→│                          │
+      │                          │ set_checkpoint(path)     │
+      │─────────────────────────→│                          │
+      │                          │                          │
+      │ get_weights()            │                          │
+      │─────────────────────────→│                          │
+      │                          │ load_metadata(path)      │
+      │─────────────────────────→│                          │
+      │← metadata (tensor 列表) ─│                          │
+      │                          │                          │
+      │                          │ for each tensor:         │
+      │                          │   get(storage_key)       │
+      │─────────────────────────→│                          │
+      │← (name, tensor) 流 ─────│                          │
+      │ param.data.copy_(tensor) │                          │
+      │                          │                          │
+```
+
 ## 2.4 并发模型
 
 ```
@@ -433,6 +669,16 @@ ActorPoolManager    ExternalExecutor    ExternalWorkerActor
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+CacheManagerActor 是**串行 Actor**（Ray Actor 默认单线程执行方法），天然串行化编译锁的申请与释放，保证锁的原子性：
+
+```
+CacheManagerActor (单线程 Actor):
+├── 方法调用串行执行 (pull / push / try_acquire_compile_lock / ...)
+├── _compile_locks 无需加锁 (Actor 天然互斥)
+├── 线程模型: 简单，无后台线程
+└── 可扩展: 如需并行 pull/push，可在 Actor 内引入线程池
+```
+
 ---
 
 # 3. 开发视图（Development View）
@@ -442,30 +688,38 @@ ActorPoolManager    ExternalExecutor    ExternalWorkerActor
 ## 3.1 模块划分
 
 ```
-vllm/
+vllm/                                        # vLLM 核心 (仅 4 处参数传递)
 ├── v1/
-│   ├── executor/
-│   │   ├── abstract.py              # Executor 基类 (不修改)
-│   │   ├── uniproc_executor.py      # 单进程执行器 (不修改)
-│   │   ├── multiproc_executor.py    # 多进程执行器 (不修改)
-│   │   ├── ray_executor.py          # Ray V1 执行器 (不修改)
-│   │   ├── ray_executor_v2.py       # Ray V2 执行器 (不修改)
-│   │   └── external_executor.py     # ⭐ 新增: ExternalExecutor
-│   │
-│   ├── engine/
-│   │   ├── async_llm.py             # ⭐ 修改: 添加 external_actors 参数
-│   │   ├── core.py                  # ⭐ 修改: 传递 external_actors
-│   │   ├── core_client.py           # ⭐ 修改: 传递 external_actors
-│   │   └── utils.py                 # ⭐ 修改: 传递 external_actors
-│   │
-│   └── worker/
-│       ├── gpu_worker.py            # (不修改)
-│       └── gpu_model_runner.py      # (不修改)
+│   └── engine/
+│       ├── async_llm.py             # ⭐ 修改: 添加 external_actors 参数
+│       ├── core.py                  # ⭐ 修改: 传递 external_actors
+│       ├── core_client.py           # ⭐ 修改: 传递 external_actors
+│       └── utils.py                 # ⭐ 修改: 传递 external_actors
 │
-└── external/                         # ⭐ 新增: 外部模块
-    ├── __init__.py
-    ├── actor_pool_manager.py        # ⭐ 新增: ActorPoolManager
-    └── external_worker_actor.py     # ⭐ 新增: ExternalWorkerActor
+multi-task-infer/                            # ⭐ 新增: 独立插件包 (G5 最小侵入)
+├── pyproject.toml                     # 包配置 + vllm.general_plugins 入口点
+├── vllm_external_executor/            # 插件代码
+│   ├── __init__.py                    # 模块入口 + register_plugin()
+│   ├── external_executor.py           # ⭐ ExternalExecutor (继承 RayExecutorV2)
+│   ├── actor_pool_manager.py          # ⭐ ActorPoolManager
+│   ├── external_worker_actor.py       # ⭐ ExternalWorkerActor + ActorState
+│   ├── cache_manager_actor.py         # ⭐ CacheManagerActor (G6)
+│   └── storage_checkpoint_engine.py   # ⭐ StorageCheckpointEngine + StorageBackend (G7)
+├── examples/
+│   ├── basic_usage.py                 # 使用示例
+│   └── mooncake_config.json           # Mooncake 配置模板
+├── tests/
+│   └── test_storage_checkpoint_engine.py   # 测试: nfs / mooncake_mock / mooncake
+├── README.md                          # 使用文档
+├── STORAGE_CHECKPOINT_ENGINE_DESIGN.md
+├── STARTUP_DEPENDENCIES.md            # 启动依赖清单
+└── verify_dependencies.sh             # 依赖验证脚本
+
+说明:
+- vLLM 核心零侵入 (G5): ExternalExecutor 不放入 vllm/v1/executor/，
+  而是作为独立插件包通过 executor_class 参数注入
+- 插件通过 pyproject.toml 的 entry-points.vllm.general_plugins 注册
+- 代码行宽 ≤ 88 字符, Google 风格 docstring
 ```
 
 ## 3.2 依赖关系
@@ -505,11 +759,40 @@ vllm/
 │  └─────────────────────┘     │   Actor)            │                            │
 │                              └─────────────────────┘                            │
 │                                                                                  │
+│  ┌─────────────────────┐     ┌─────────────────────┐                            │
+│  │  external_executor  │────→│  cache_manager      │                            │
+│  │  .py                │     │  _actor.py          │                            │
+│  │  (ExternalExecutor) │     │  (CacheManagerActor)│                            │
+│  └─────────────────────┘     └─────────┬───────────┘                            │
+│                                        │ uses                                    │
+│                                        ↓                                         │
+│                              ┌─────────────────────┐                            │
+│                              │  Ray Object Store    │                            │
+│                              │  + NFS (大缓存)      │                            │
+│                              └─────────────────────┘                            │
+│                                                                                  │
+│  ┌─────────────────────┐     ┌─────────────────────┐                            │
+│  │  external_worker    │────→│  storage_checkpoint │                            │
+│  │  _actor.py          │     │  _engine.py         │                            │
+│  │  (ExternalWorker    │     │  (StorageCheckpoint │                            │
+│  │   Actor)            │     │   Engine)           │                            │
+│  └─────────────────────┘     └─────────┬───────────┘                            │
+│                                        │ 使用                                     │
+│                                        ↓                                         │
+│                              ┌─────────────────────┐                            │
+│                              │  StorageBackend     │                            │
+│                              │  ├─ NFSStorageBackend                             │
+│                              │  └─ MooncakeStoreBackend                          │
+│                              └─────────────────────┘                            │
+│                                                                                  │
 │  外部依赖:                                                                       │
 │  ├── ray (Actor 管理)                                                            │
 │  ├── torch.distributed (NCCL/HCCl)                                              │
 │  ├── vllm.distributed.weight_transfer (权重热更新)                               │
-│  └── vllm.distributed.device_communicators.shm_broadcast (MessageQueue)         │
+│  ├── vllm.distributed.device_communicators.shm_broadcast (MessageQueue)         │
+│  ├── safetensors (NFS 权重序列化)                                                │
+│  ├── mooncake-transfer-engine (可选, Mooncake Store 后端)                        │
+│  └── verl.checkpoint_engine (可选, 注册到 verl CheckpointEngineRegistry)        │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -643,12 +926,28 @@ class EngineCore:
 
 ## 3.4 新增文件清单
 
-| 文件 | 说明 | 行数估计 |
+| 文件 | 说明 | 实际行数 |
 |------|------|---------|
-| `vllm/v1/executor/external_executor.py` | ExternalExecutor 实现 | ~300 |
-| `vllm/external/__init__.py` | 外部模块入口 | ~10 |
-| `vllm/external/actor_pool_manager.py` | ActorPoolManager 实现 | ~200 |
-| `vllm/external/external_worker_actor.py` | ExternalWorkerActor 实现 | ~250 |
+| `multi-task-infer/pyproject.toml` | 包配置 + vllm.general_plugins 入口点 | ~50 |
+| `vllm_external_executor/__init__.py` | 模块入口 + register_plugin() | ~110 |
+| `vllm_external_executor/external_executor.py` | ExternalExecutor 实现（G1/G4） | ~490 |
+| `vllm_external_executor/actor_pool_manager.py` | ActorPoolManager 实现（G1/G2） | ~333 |
+| `vllm_external_executor/external_worker_actor.py` | ExternalWorkerActor 实现 | ~496 |
+| `vllm_external_executor/cache_manager_actor.py` | CacheManagerActor 实现（G6） | ~474 |
+| `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~880 |
+| `examples/basic_usage.py` | 使用示例 | ~223 |
+| `examples/mooncake_config.json` | Mooncake 配置模板 | ~10 |
+| `tests/test_storage_checkpoint_engine.py` | 测试：nfs / mooncake_mock / mooncake | ~483 |
+| `verify_dependencies.sh` | 依赖验证脚本 | ~120 |
+
+vLLM 核心修改（最小侵入，G5）：
+
+| 文件 | 修改内容 |
+|------|---------|
+| `vllm/v1/engine/async_llm.py` | +5 行：添加 external_actors 参数并传递 |
+| `vllm/v1/engine/core.py` | +11 行：添加 external_actors 参数并传给 executor |
+| `vllm/v1/engine/core_client.py` | +9 行：透传 external_actors |
+| `vllm/v1/engine/utils.py` | +4 行：透传 external_actors |
 
 ---
 
@@ -784,6 +1083,64 @@ class EngineCore:
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 4.3.1 编译缓存混合存储架构（G6）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          编译缓存存储拓扑                                         │
+│                                                                                  │
+│  torch.compile 缓存 (本地 ~/.cache/vllm/torch_compile_cache/{hash}/)             │
+│  ├── 1B-3B 模型:   50-200 MB                                                    │
+│  ├── 7B-13B 模型:  200 MB - 1 GB                                                 │
+│  └── 30B-70B 模型: 1-5 GB                                                        │
+│                                                                                  │
+│  混合分流策略 (ROT = 50 MB):                                                     │
+│  ┌────────────────────────────────────────────┐   ┌───────────────────────────┐ │
+│  │  小缓存 (< 50 MB)                          │   │  大缓存 (≥ 50 MB)          │ │
+│  │  ─────────────────────────────            │   │  ────────────────────────  │ │
+│  │  Ray Object Store (默认 30% 节点内存)      │   │  NFS + gzip 压缩            │ │
+│  │  - 同节点零拷贝                             │   │  - tar.gz 打包              │ │
+│  │  - 无需额外部署                             │   │  - 跨节点共享               │ │
+│  │  - 适合 1B-3B 模型                          │   │  - 适合 7B+ 模型            │ │
+│  │  限制: ~100 MB/对象阈值, 超限 spill          │   │  限制: 依赖 NFS 带宽        │ │
+│  └────────────────────────────────────────────┘   └───────────────────────────┘ │
+│                                                                                  │
+│  缓存流程:                                                                       │
+│  ① 本地缓存命中 → 直接使用 (最快)                                                │
+│  ② CacheManagerActor.pull() → 解压到本地 → 使用                                  │
+│  ③ fallback: 获取编译锁 → 编译 → 打包 → push → 释放锁                            │
+│                                                                                  │
+│  编译锁: 防止多个节点同时编译同一缓存                                             │
+│  status: acquired (获锁编译) / wait (他人编译中, 等待) / done (缓存已就绪)       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.3.2 存储权重加载资源（G7）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          存储权重加载拓扑                                         │
+│                                                                                  │
+│  StorageBackend 对比:                                                            │
+│  ┌───────────────────────────┐   ┌───────────────────────────────┐             │
+│  │  NFSStorageBackend        │   │  MooncakeStoreBackend         │             │
+│  │  ─────────────────────    │   │  ──────────────────────────   │             │
+│  │  格式: safetensors        │   │  格式: MooncakeDistributedStore│             │
+│  │  部署: NFS 挂载即可       │   │  部署: mooncake_master +         │             │
+│  │  性能: 依赖网络带宽       │   │        (可选) mooncake_client   │             │
+│  │         (~1-3 GB/s)       │   │  性能: RDMA ~9 GB/s (IB)       │             │
+│  │                           │   │        GPUDirect 支持          │             │
+│  │  适用: 小集群/无 RDMA      │   │  适用: 大规模集群/热切换频繁    │             │
+│  └───────────────────────────┘   └───────────────────────────────┘             │
+│                                                                                  │
+│  Mooncake Key 约定:                                                              │
+│    ckpt:{checkpoint_path}:metadata      → 元数据 JSON                            │
+│    ckpt:{checkpoint_path}:tensor:{name} → 权重 tensor 字节                        │
+│                                                                                  │
+│  内存占用: 加载时按 tensor 流式处理, 峰值 = 单 tensor 大小                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## 4.4 故障域
 
 ```
@@ -808,6 +1165,13 @@ class EngineCore:
 │  │  weight_transfer 失败        模型加载失败          回退到磁盘加载          │   │
 │  │                              需要重新加载模型      或标记 Actor FAILED     │   │
 │  │                                                                          │   │
+│  │  CacheManagerActor 崩溃     编译缓存共享不可用     Worker 降级为直接编译   │   │
+│  │                             缓存拉取失败          编译锁失效, 仅损失      │   │
+│  │                                                   去重能力, 不影响推理    │   │
+│  │                                                                          │   │
+│  │  Mooncake/NFS 存储故障      权重加载失败          回退到磁盘加载 /         │   │
+│  │                             编译缓存读写失败      跳过缓存直接编译         │   │
+│  │                                                                          │   │
 │  │  节点故障                    该节点所有 Actor 不可用  ActorPoolManager     │   │
 │  │                              需要重新分配 Actor    检测到后标记 FAILED     │   │
 │  │                                                   从其他节点 acquire      │   │
@@ -825,32 +1189,32 @@ class EngineCore:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  场景: 预启动 Actor Pool                                                         │
-│  参与者: 运维人员, ActorPoolManager, Ray Cluster, ExternalWorkerActor            │
-│                                                                                  │
-│  前置条件: Ray Cluster 已启动，GPU 资源可用                                      │
-│                                                                                  │
-│  主流程:                                                                         │
-│  1. 运维人员调用 ActorPoolManager.pre_start(num_actors=8, devices_per_node=...)  │
-│  2. ActorPoolManager 创建 Placement Group                                        │
-│  3. ActorPoolManager 创建 8 个 ExternalWorkerActor                               │
-│  4. 每个 Actor:                                                                  │
-│     a. 绑定 GPU 设备                                                             │
-│     b. Import 公共库 (torch, vllm, Worker, ModelRunner)                          │
-│     c. 预热 NCCL/HCCl (创建临时 ProcessGroup 并销毁)                             │
-│     d. 状态设为 IDLE                                                             │
-│  5. ActorPoolManager 等待所有 Actor 就绪                                         │
-│  6. ActorPoolManager 构建 node_mapping (node_id → actor_indices)                 │
-│                                                                                  │
-│  后置条件: 8 个 Actor 处于 IDLE 状态，可被租用                                   │
-│                                                                                  │
-│  耗时: ~10-20s                                                                   │
-│                                                                                  │
-│  涉及的视图:                                                                     │
-│  - 逻辑视图: ActorPoolManager.pre_start()                                        │
-│  - 进程视图: Actor 创建、预初始化                                                 │
-│  - 开发视图: external/actor_pool_manager.py, external/external_worker_actor.py   │
-│  - 物理视图: Placement Group、GPU 绑定                                           │
+│  场景: 预启动 Actor Pool                                                       │
+│  参与者: 运维人员, ActorPoolManager, Ray Cluster, ExternalWorkerActor          │
+│                                                                                │
+│  前置条件: Ray Cluster 已启动，GPU 资源可用                                    │
+│                                                                                │
+│  主流程:                                                                       │
+│  1. 运维人员调用 ActorPoolManager.pre_start(num_actors=8, devices_per_node=...)│
+│  2. ActorPoolManager 创建 Placement Group                                      │
+│  3. ActorPoolManager 创建 8 个 ExternalWorkerActor                             │
+│  4. 每个 Actor:                                                                │
+│     a. 绑定 GPU 设备                                                           │
+│     b. Import 公共库 (torch, vllm, Worker, ModelRunner)                        │
+│     c. 预热 NCCL/HCCl (创建临时 ProcessGroup 并销毁)                           │
+│     d. 状态设为 IDLE                                                           │
+│  5. ActorPoolManager 等待所有 Actor 就绪                                       │
+│  6. ActorPoolManager 构建 node_mapping (node_id → actor_indices)               │
+│                                                                                │
+│  后置条件: 8 个 Actor 处于 IDLE 状态，可被租用                                 │
+│                                                                                │
+│  耗时: ~10-20s                                                                 │
+│                                                                                │
+│  涉及的视图:                                                                   │
+│  - 逻辑视图: ActorPoolManager.pre_start()                                      │
+│  - 进程视图: Actor 创建、预初始化                                              │
+│  - 开发视图: actor_pool_manager.py, external_worker_actor.py                   │
+│  - 物理视图: Placement Group、GPU 绑定                                         │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -887,41 +1251,52 @@ class EngineCore:
 │  涉及的视图:                                                                     │
 │  - 逻辑视图: ExternalExecutor._init_executor()                                   │
 │  - 进程视图: Actor 初始化、模型加载、KV Cache 分配                                │
-│  - 开发视图: external/external_executor.py                                       │
+│  - 开发视图: vllm_external_executor/external_executor.py                  │
 │  - 物理视图: MessageQueue (SHM/TCP)、NCCL/HCCl、weight_transfer                  │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 5.3 场景 3：模型热切换
 
+> ✅ **实现状态：已实现**。`ExternalWorkerActor.switch_model()` 在 worker 侧
+> 重建模型并加载权重（存储加载 G7 首选 / weight_transfer 备选 / dummy 兜底）；
+> `ExternalExecutor.switch_model()` 负责 world_size 校验、并行下发、
+> KV cache 重分配（`_reinitialize_kv_cache`）与编译缓存懒加载。
+> 调用方需保证切换时无 in-flight 推理请求。
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │  场景: 模型热切换                                                                │
-│  参与者: 用户, ExternalExecutor, Actors, weight_transfer Engine                  │
+│  参与者: 用户, ExternalExecutor, Actors, StorageCheckpointEngine / weight_transfer│
 │                                                                                  │
 │  前置条件: vLLM 实例正在运行模型 A，需要切换到模型 B                              │
+│            (world_size 不变; 无 in-flight 请求)                                  │
 │                                                                                  │
 │  主流程:                                                                         │
-│  1. 用户调用 executor.switch_model(model_b_config, weight_transfer_init_info)    │
-│  2. ExternalExecutor 暂停推理 (停止调度新请求)                                   │
-│  3. ExternalExecutor 调用 Actor.reset_model() (释放模型 A 的权重和 KV Cache)     │
-│  4. ExternalExecutor 调用 Actor.load_model_via_weight_transfer(model_b_config)   │
-│     a. 创建模型 B 的结构 (dummy weights)                                         │
-│     b. 初始化 weight_transfer engine                                             │
-│     c. 通过 weight_transfer 拉取模型 B 的真实权重                                │
-│  5. ExternalExecutor 调用 Actor.initialize_kv_cache() (重新分配 KV Cache)        │
-│  6. ExternalExecutor 调用 Actor.compile_or_warm_up_model() (Graph Capture)        │
-│  7. ExternalExecutor 恢复推理                                                    │
+│  1. 用户调用 executor.switch_model(new_vllm_config, checkpoint_path, backend)    │
+│  2. ExternalExecutor 校验 world_size 一致                                        │
+│  3. 并行下发 actor.switch_model(vllm_config, ...) 到所有 Worker                  │
+│     a. worker.shutdown() → 释放模型 A 权重和 KV Cache (state=RELEASED)          │
+│     b. 用新 vllm_config 重建 WorkerWrapperBase (复用 MQ 与分布式环境)            │
+│     c. init_device() (PG 幂等, 已初始化则跳过)                                   │
+│     d. 加载模型 B 权重:                                                         │
+│        - 【首选 G7】load_model_from_storage (NFS / Mooncake Store)              │
+│        - 【备选】load_model_via_weight_transfer (NCCL/IPC/sharded_rdt)          │
+│        - 【兜底】dummy weights                                                    │
+│  4. _reinitialize_kv_cache(): 重新 profiling 可用内存并分配 KV cache            │
+│  5. _handle_compilation_optimization(): 编译缓存懒加载 (见场景 6)               │
+│  6. 恢复推理                                                                    │
 │                                                                                  │
 │  后置条件: vLLM 实例已切换到模型 B，可以处理推理请求                              │
 │                                                                                  │
 │  耗时: ~10-60s (相比重新创建实例 68-495s 大幅减少)                              │
 │                                                                                  │
 │  涉及的视图:                                                                     │
-│  - 逻辑视图: ExternalExecutor.switch_model()                                     │
-│  - 进程视图: 模型卸载、权重传输、KV Cache 重新分配                                │
-│  - 开发视图: external/external_executor.py, weight_transfer 模块                 │
-│  - 物理视图: weight_transfer 通信 (NCCL/IPC/sharded_rdt)                         │
+│  - 逻辑视图: ExternalExecutor.switch_model(), ExternalWorkerActor.switch_model() │
+│  - 进程视图: 模型卸载、权重加载、KV Cache 重新分配                                │
+│  - 开发视图: vllm_external_executor/external_executor.py,                        │
+│             vllm_external_executor/storage_checkpoint_engine.py                  │
+│  - 物理视图: StorageBackend (NFS/Mooncake) / weight_transfer 通信                │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -929,29 +1304,29 @@ class EngineCore:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  场景: 弹性伸缩（TP/PP 变化）                                                    │
-│  参与者: 用户, ActorPoolManager, ExternalExecutor, Actors                        │
-│                                                                                  │
-│  前置条件: vLLM 实例使用 TP=4, PP=2 (8 个 Actor)，需要扩展到 TP=8, PP=2 (16 个) │
-│                                                                                  │
-│  主流程:                                                                         │
-│  1. 用户调用 pool.acquire(tp_size=8, pp_size=2) 获取 16 个 Actor                 │
-│     - Pool 返回 8 个已有 Actor + 8 个新 Actor (如果有的话)                        │
-│     - 或者 Pool 返回错误 (空闲 Actor 不足)                                       │
-│  2. 用户创建新的 AsyncLLM (使用 16 个 Actor)                                     │
-│  3. 旧的 vLLM 实例释放 Actor: pool.release(old_actors)                           │
-│  4. 新的 vLLM 实例使用 16 个 Actor 初始化                                        │
-│     - 重新初始化 NCCL/HCCl (world_size=16)                                       │
-│     - 重新加载模型 (TP=8 分片)                                                   │
-│     - 重新分配 KV Cache                                                          │
-│                                                                                  │
-│  后置条件: vLLM 实例已扩展到 TP=8, PP=2                                          │
-│                                                                                  │
-│  涉及的视图:                                                                     │
-│  - 逻辑视图: ActorPoolManager.acquire(), ExternalExecutor._init_executor()       │
-│  - 进程视图: NCCL/HCCl 重新初始化、模型重新加载                                   │
-│  - 开发视图: external/actor_pool_manager.py, external/external_executor.py       │
-│  - 物理视图: 新的 NCCL/HCCl 拓扑 (16 个 Worker)                                  │
+│  场景: 弹性伸缩（TP/PP 变化）                                                  │
+│  参与者: 用户, ActorPoolManager, ExternalExecutor, Actors                      │
+│                                                                                │
+│  前置条件: vLLM 实例使用 TP=4, PP=2 (8 个 Actor)，需要扩展到 TP=8, PP=2 (16 个)│
+│                                                                                │
+│  主流程:                                                                       │
+│  1. 用户调用 pool.acquire(tp_size=8, pp_size=2) 获取 16 个 Actor               │
+│     - Pool 返回 8 个已有 Actor + 8 个新 Actor (如果有的话)                     │
+│     - 或者 Pool 返回错误 (空闲 Actor 不足)                                     │
+│  2. 用户创建新的 AsyncLLM (使用 16 个 Actor)                                   │
+│  3. 旧的 vLLM 实例释放 Actor: pool.release(old_actors)                         │
+│  4. 新的 vLLM 实例使用 16 个 Actor 初始化                                      │
+│     - 重新初始化 NCCL/HCCl (world_size=16)                                     │
+│     - 重新加载模型 (TP=8 分片)                                                 │
+│     - 重新分配 KV Cache                                                        │
+│                                                                                │
+│  后置条件: vLLM 实例已扩展到 TP=8, PP=2                                        │
+│                                                                                │
+│  涉及的视图:                                                                   │
+│  - 逻辑视图: ActorPoolManager.acquire(), ExternalExecutor._init_executor()     │
+│  - 进程视图: NCCL/HCCl 重新初始化、模型重新加载                                │
+│  - 开发视图: actor_pool_manager.py, external_executor.py                       │
+│  - 物理视图: 新的 NCCL/HCCl 拓扑 (16 个 Worker)                                │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -981,11 +1356,78 @@ class EngineCore:
 │                                                                                  │
 │  耗时: ~5-10s                                                                    │
 │                                                                                  │
-│  涉及的视图:                                                                     │
+│  涉及视图:                                                                       │
 │  - 逻辑视图: ExternalExecutor.shutdown(), Actor.reset()                          │
 │  - 进程视图: 资源释放、状态重置                                                   │
-│  - 开发视图: external/external_executor.py, external/external_worker_actor.py    │
+│  - 开发视图: vllm_external_executor/external_executor.py,                        │
 │  - 物理视图: GPU 内存释放、NCCL/HCCl 销毁                                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 5.6 场景 6：编译缓存懒加载共享（G6）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  场景: 编译缓存懒加载共享                                                         │
+│  参与者: ExternalExecutor, CacheManagerActor, Workers, Ray Object Store, NFS      │
+│                                                                                  │
+│  前置条件: 集群已启动 CacheManagerActor (由 ActorPoolManager.pre_start 创建)      │
+│                                                                                  │
+│  主流程 (每个 vLLM 实例初始化时):                                                 │
+│  1. ExternalExecutor._handle_compilation_optimization():                          │
+│     a. 计算 cache_hash (模型架构/TP/PP/DP/cudagraph 配置)                         │
+│     b. 检查本地缓存 ~/.cache/vllm/torch_compile_cache/{hash}/                    │
+│        - 命中 → 跳过编译，直接进入 Graph Capture                                 │
+│     c. 未命中 → 向 CacheManagerActor.pull(hash) 拉取                             │
+│        - 命中 → 解压到本地 → 跳过编译                                           │
+│     d. 都未命中 → try_acquire_compile_lock(hash)                                │
+│        - "acquired" → 编译 → 打包 → push(hash) → release_lock                  │
+│        - "wait"     → 等待他人编译完成 → 再 pull                                │
+│        - "done"     → 直接 pull                                                 │
+│  2. 编译完成后 Workers 进入 Graph Capture 阶段                                    │
+│                                                                                  │
+│  后置条件: 所有节点共享一份编译产物，重复编译被消除                                │
+│                                                                                  │
+│  性能:                                                                           │
+│  - 节点 1 (无缓存): 30-180s (编译)                                               │
+│  - 节点 2+: 5-10s (拉取缓存)                                                    │
+│                                                                                  │
+│  涉及的视图:                                                                     │
+│  - 逻辑视图: ExternalExecutor._handle_compilation_optimization()                 │
+│  - 进程视图: CacheManagerActor pull/push/编译锁 交互 (见 2.3.5 时序)             │
+│  - 开发视图: vllm_external_executor/cache_manager_actor.py                       │
+│  - 物理视图: Ray Object Store (<50MB) + NFS (≥50MB) 混合存储                      │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 5.7 场景 7：存储权重加载（G7）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  场景: 从存储加载模型权重                                                         │
+│  参与者: ExternalWorkerActor, StorageCheckpointEngine, StorageBackend             │
+│                                                                                  │
+│  前置条件: checkpoint 已保存到存储 (NFS 目录或 Mooncake Store)                    │
+│                                                                                  │
+│  主流程:                                                                         │
+│  1. Worker.initialize_worker() 创建模型结构 (dummy weights)                      │
+│  2. Worker.load_model_from_storage(checkpoint_path, backend, config):            │
+│     a. 创建 StorageCheckpointEngine (NFS/Mooncake)                               │
+│     b. set_checkpoint(path)                                                      │
+│     c. get_weights() 流式获取 (name, tensor)                                     │
+│     d. param.data.copy_(tensor) 写入模型                                         │
+│  3. 与 weight_transfer 相比:                                                     │
+│     - 不需要 Trainer 在线 (存储是持久的)                                         │
+│     - 适合多任务推理 (多次从存储加载不同权重)                                     │
+│     - Mooncake 后端 RDMA ~9 GB/s                                                 │
+│                                                                                  │
+│  后置条件: 模型权重已就绪，可进入 KV Cache 初始化和编译阶段                       │
+│                                                                                  │
+│  涉及的视图:                                                                     │
+│  - 逻辑视图: ExternalWorkerActor.load_model_from_storage()                       │
+│  - 进程视图: 存储加载时序 (见 2.3.6)                                             │
+│  - 开发视图: vllm_external_executor/storage_checkpoint_engine.py                 │
+│  - 物理视图: NFSStorageBackend / MooncakeStoreBackend                            │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1037,6 +1479,53 @@ class EngineCore:
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## 6.3 编译缓存共享性能（G6）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          编译缓存共享性能                                         │
+│                                                                                  │
+│  多节点部署 (无 CacheManagerActor):                                              │
+│  ┌────────────────────────────────────────────────────────────────────┐          │
+│  │  节点 1 首次启动: 30-180s (torch.compile)                          │          │
+│  │  节点 2 首次启动: 30-180s (重复编译, 浪费)                         │          │
+│  │  节点 3 首次启动: 30-180s (重复编译, 浪费)                         │          │
+│  └────────────────────────────────────────────────────────────────────┘          │
+│                                                                                  │
+│  多节点部署 (有 CacheManagerActor + NFS):                                        │
+│  ┌────────────────────────────────────────────────────────────────────┐          │
+│  │  节点 1 首次启动: 30-180s (编译 + push)                             │          │
+│  │  节点 2 首次启动: 5-10s  (pull + 解压, 跳过编译)                   │          │
+│  │  节点 3 首次启动: 5-10s  (pull + 解压, 跳过编译)                   │          │
+│  │  后续所有节点:    5-10s  (本地缓存命中)                             │          │
+│  └────────────────────────────────────────────────────────────────────┘          │
+│                                                                                  │
+│  存储带宽参考 (perl benchmark):                                                  │
+│  ┌────────────────────────────────────────┐                                     │
+│  │  mooncake (RDMA, 2*8 H100):  9.44 GB/s │                                     │
+│  │  NFS (TCP):                  ~1-3 GB/s  │                                     │
+│  └────────────────────────────────────────┘                                     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 6.4 存储权重加载性能（G7）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          存储权重加载性能                                         │
+│                                                                                  │
+│  模型大小         | NFS (1-3 GB/s)           | Mooncake (9 GB/s)                  │
+│  ──────────────────────────────────────────────────────────────────────────────  │
+│  1B-3B  (6 GB)   | 2-6s                     | ~0.7s                              │
+│  7B-13B (28 GB)  | 9-28s                    | ~3.1s                              │
+│  30B-70B (140GB) | 47-140s                  | ~15.6s                             │
+│                                                                                  │
+│  相比磁盘加载 (30-300s) 和 weight_transfer (依赖 Trainer 在线):                  │
+│  - NFS 存储加载: 持久化，无 Trainer 依赖                                         │
+│  - Mooncake 存储加载: 持久化 + RDMA 高性能                                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 # 7. 约束与限制
@@ -1046,10 +1535,12 @@ class EngineCore:
 | 约束 | 说明 | 影响 |
 |------|------|------|
 | **Actor 必须预启动** | ExternalExecutor 不创建 Actor，只从 Pool 获取 | 需要提前规划资源 |
-| **weight_transfer 必须配置** | 模型加载依赖 weight_transfer 机制 | 需要配置 Trainer 端 |
+| **模型加载三路径可选** | 磁盘加载 / weight_transfer / 存储加载 (G7) | 按场景选择，不再强依赖 weight_transfer |
 | **数据通路固定** | 必须使用 MessageQueue（与 RayExecutorV2 一致） | 无法使用其他通信方式 |
 | **模型架构变化需重建** | 如果模型架构变化，需要重新创建模型结构 | 跨架构切换较慢 |
-| **CUDA Graph 不兼容** | 不同模型的 CUDA Graph 不兼容（涉及运行时状态） | 需要重新执行 Graph Capture |
+| **CUDA Graph 不兼容** | 不同模型的 CUDA Graph 不兼容（涉及运行时状态） | 需要重新执行 Graph Capture；torch.compile 缓存可共享 (G6) |
+| **空间换时间** | 编译缓存共享需要 Ray Object Store + NFS 存储 | 大缓存 (≥50MB) 走 NFS 压缩 |
+| **缓存命中依赖配置一致** | cache_hash 取决于架构/TP/PP/DP/cudagraph 配置 | 配置不同则无法共享 |
 
 ## 7.2 已知问题
 
@@ -1059,6 +1550,8 @@ class EngineCore:
 | **Graph Capture 优化** | CUDA Graph 不能直接缓存，但可通过配置优化减少 Capture 时间 | 减少 batch size、使用 PIECEWISE 模式、确保 torch.compile 缓存启用 |
 | **KV Cache 大小变化** | 不同模型/并行策略可能需要不同大小的 KV Cache | 每次重新分配 KV Cache |
 | **分布式环境重建** | TP/PP 大小变化时需要重新初始化 NCCL/HCCl | 允许重新初始化，NPU 侧已预热所以很快 |
+| **switch_model 时序** | 热切换 (G3) 需要调用方保证无 in-flight 请求 | executor 层负责模型重建 + 存储加载 + KV cache 重分配 (已实现) |
+| **编译等待硬编码** | 编译锁等待用 time.sleep(5) 轮询 | 改为事件通知/等待机制 |
 
 ---
 
@@ -1066,12 +1559,14 @@ class EngineCore:
 
 | 编号 | 问题 | 选项 | 建议 |
 |------|------|------|------|
-| Q1 | weight_transfer 的触发方式？ | A) Trainer 主动推送 B) Worker 主动拉取 | 需要确认使用哪种方式 |
+| Q1 | weight_transfer 的触发方式？ | A) Trainer 主动推送 B) Worker 主动拉取 C) 改用存储加载 (G7) | 已实现 C；A/B 视场景 |
 | Q2 | 模型结构是否可以在 Actor 预启动时就创建？ | A) 预启动时创建 (meta device) B) acquire 后创建 | 建议 B，更灵活 |
 | Q3 | 如何优化 Graph Capture 时间？ | A) 减少 batch size B) 使用 PIECEWISE 模式 C) 确保 torch.compile 缓存 D) 以上全部 | 建议 D，综合优化 |
-| Q4 | weight_transfer 失败时的处理策略？ | A) 回退到磁盘加载 B) 标记 Actor FAILED | 建议 A |
+| Q4 | weight_transfer 失败时的处理策略？ | A) 回退到磁盘加载 B) 标记 Actor FAILED C) 回退到存储加载 | 建议 A/C |
 | Q5 | Actor Pool 是否需要持久化？ | A) 需要 (跨 vLLM 实例) B) 不需要 (每次重建) | 建议 A |
 | Q6 | 是否需要支持多 vLLM 实例共享同一 Pool？ | A) 需要 B) 不需要 | 建议 A，提高资源利用率 |
+| Q7 | 编译锁等待机制？ | A) 轮询 (time.sleep) B) 事件通知 C) Ray 条件变量 | 建议 C |
+| Q8 | Mooncake 后端是否需要 batch API？ | A) 单 tensor put/get B) batch_put_from_multi_buffers | 建议 B，提升吞吐 |
 
 ---
 
@@ -1091,6 +1586,14 @@ class EngineCore:
 | EngineCore | `vllm/v1/engine/core.py` |
 | AsyncLLM | `vllm/v1/engine/async_llm.py` |
 | WeightTransferEngine | `vllm/distributed/weight_transfer/base.py` |
+| ExternalExecutor (插件) | `multi-task-infer/vllm_external_executor/external_executor.py` |
+| ActorPoolManager (插件) | `multi-task-infer/vllm_external_executor/actor_pool_manager.py` |
+| ExternalWorkerActor (插件) | `multi-task-infer/vllm_external_executor/external_worker_actor.py` |
+| CacheManagerActor (插件) | `multi-task-infer/vllm_external_executor/cache_manager_actor.py` |
+| StorageCheckpointEngine (插件) | `multi-task-infer/vllm_external_executor/storage_checkpoint_engine.py` |
+| verl CheckpointEngine 接口 | `verl/verl/checkpoint_engine/base.py` |
+| verl MooncakeCheckpointEngine | `verl/verl/checkpoint_engine/mooncake_checkpoint_engine.py` |
+| MooncakeDistributedStore API | `mooncake/store` (mooncake-transfer-engine 包) |
 
 ## 9.2 术语对照表
 
@@ -1104,3 +1607,8 @@ class EngineCore:
 | Placement Group | 放置组 |
 | CUDA Graph | CUDA 图 |
 | NCCL/HCCl | NVIDIA/Huawei 集合通信库 |
+| CacheManagerActor | 缓存管理器 Actor |
+| 编译锁 | Compilation Lock |
+| 懒加载 | Lazy Loading |
+| StorageCheckpointEngine | 存储 checkpoint 引擎 |
+| Mooncake Store | Mooncake 分布式存储 |

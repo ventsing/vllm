@@ -464,27 +464,115 @@ class ExternalExecutor(RayExecutorV2):
     def switch_model(
         self,
         new_vllm_config: VllmConfig,
+        checkpoint_path: str | None = None,
+        storage_backend: str = "nfs",
+        storage_config: dict | None = None,
         weight_transfer_init_info: dict | None = None,
+        reinitialize_cache: bool = True,
     ) -> None:
         """
         Switch to a new model (hot-switching).
         
-        This method pauses inference, releases the current model,
-        and loads a new model via weight_transfer.
+        Releases the current model on every worker, rebuilds them with the
+        new vllm_config, and loads the new weights from the chosen source.
+        Optionally re-profiles and re-allocates KV cache, then re-runs the
+        compilation optimization (cache-aware lazy loading).
+        
+        Note: The caller is responsible for ensuring no in-flight inference
+        requests when calling this method (stop scheduling new requests and
+        wait for running requests to finish). The executor cannot safely
+        drain the engine's scheduler from here.
         
         Args:
-            new_vllm_config: New vLLM configuration
-            weight_transfer_init_info: Weight transfer initialization info
+            new_vllm_config: New vLLM configuration. The parallel layout
+                (world_size) must match the current one - actors are bound
+                to fixed devices, so TP/PP changes require a new acquire().
+            checkpoint_path: Checkpoint path for storage loading (optional).
+            storage_backend: Storage backend name ("nfs" or "mooncake").
+            storage_config: Backend-specific configuration.
+            weight_transfer_init_info: Weight transfer init info (optional).
+            reinitialize_cache: Whether to re-profile and re-allocate KV
+                cache after the model switch.
         """
-        logger.info("Switching model...")
+        import ray
         
-        # TODO: Implement model hot-switching
-        # This requires:
-        # 1. Pause inference (stop scheduling new requests)
-        # 2. Reset model on each worker
-        # 3. Load new model via weight_transfer
-        # 4. Re-initialize KV Cache
-        # 5. Re-compile CUDA Graph
-        # 6. Resume inference
+        parallel_config = new_vllm_config.parallel_config
+        if parallel_config.world_size != self.world_size:
+            raise ValueError(
+                f"switch_model requires world_size to stay constant: "
+                f"current={self.world_size}, new={parallel_config.world_size}. "
+                f"Change TP/PP by releasing actors and acquiring a new set."
+            )
         
-        raise NotImplementedError("Model hot-switching is not yet implemented")
+        logger.info("Switching model (hot-switching)...")
+        
+        # 1. Update executor-side config reference
+        self.vllm_config = new_vllm_config
+        
+        # 2. Switch model on every worker (parallel ray calls)
+        switch_refs = [
+            handle.actor.switch_model.remote(
+                vllm_config=new_vllm_config,
+                checkpoint_path=checkpoint_path,
+                storage_backend=storage_backend,
+                storage_config=storage_config,
+                weight_transfer_init_info=weight_transfer_init_info,
+            )
+            for handle in self.ray_worker_handles
+        ]
+        ray.get(switch_refs)
+        logger.info("All workers switched to the new model")
+        
+        # 3. Re-initialize KV cache (profile available memory and allocate)
+        if reinitialize_cache:
+            self._reinitialize_kv_cache()
+        
+        # 4. Compilation optimization (cache-aware lazy loading)
+        self._handle_compilation_optimization()
+        
+        logger.info("Model switch complete")
+    
+    def _reinitialize_kv_cache(self) -> None:
+        """
+        Re-profile available GPU memory and re-allocate KV cache.
+        
+        Mirrors the engine-core initialization path (EngineCore.
+        _initialize_kv_caches) so that a switched model gets a consistent
+        KV cache. Best-effort: falls back with a warning when profiling
+        fails (e.g. attention backends are not registered in this process).
+        """
+        try:
+            from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+            from vllm.v1.core.single_type_kv_cache_manager import (
+                register_all_kvcache_specs,
+            )
+            from vllm.v1.attention.backends.utils import (
+                resolve_kv_cache_layout,
+            )
+            
+            # 1. Register KV cache specs for the new model
+            register_all_kvcache_specs(self.vllm_config)
+            
+            # 2. Collect KV cache specs and resolve the cache layout
+            kv_cache_specs = self.get_kv_cache_specs()
+            supported_layouts = self.get_supported_kv_cache_layouts()
+            layout = resolve_kv_cache_layout(
+                self.vllm_config, supported_layouts,
+                [s for specs in kv_cache_specs for s in specs.values()],
+            )
+            self.set_kv_cache_layout(layout.name)
+            
+            # 3. Profile available GPU memory
+            available_gpu_memory = self.determine_available_memory()
+            
+            # 4. Compute KV cache configs and allocate on workers
+            kv_cache_configs = get_kv_cache_configs(
+                self.vllm_config, kv_cache_specs, available_gpu_memory
+            )
+            self.initialize_from_config(kv_cache_configs)
+        except Exception as e:
+            logger.warning(
+                f"Failed to re-initialize KV cache after switch: {e}. "
+                f"Call executor.initialize_from_config() manually with "
+                f"the kv_cache_configs for the new model."
+            )
