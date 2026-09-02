@@ -257,6 +257,9 @@ class ActorPoolManager:
                 logger.warning(f"Actor not found in pool, skipping")
                 continue
             
+            # Mark as RELEASED (transitional state before reset completes)
+            self.states[idx] = ActorState.RELEASED
+            
             # Reset the actor
             try:
                 ray.get(actor.reset.remote())

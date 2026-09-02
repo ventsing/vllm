@@ -77,6 +77,13 @@ class ExternalWorkerActor:
         # For distributed initialization
         self._dist_init_store = None
         
+        # For switch_model: saved init kwargs (survive worker rebuilds)
+        self._rank: int | None = None
+        self._local_rank: int | None = None
+        self._dist_init_method: str | None = None
+        self._is_driver_worker: bool = False
+        self._is_driver_node: bool = False
+        
         # Message queues (set during initialize_worker)
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
@@ -219,6 +226,12 @@ class ExternalWorkerActor:
         # Store config
         self.vllm_config = vllm_config
         self._is_driver_node = is_driver_node
+        
+        # Save init kwargs for later switch_model (worker rebuild)
+        self._rank = rank
+        self._local_rank = local_rank
+        self._dist_init_method = distributed_init_method
+        self._is_driver_worker = is_driver_worker
         
         # Create WorkerWrapperBase
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
@@ -387,6 +400,9 @@ class ExternalWorkerActor:
         for name, tensor in engine.get_weights():
             try:
                 param = model.get_parameter(name)
+                # Copy directly into the parameter's storage. get_weights()
+                # already places the tensor on worker.device (no-op if it
+                # was loaded there), so copy_() is the only GPU allocation.
                 param.data.copy_(tensor)
                 loaded_count += 1
             except AttributeError:
@@ -397,6 +413,91 @@ class ExternalWorkerActor:
         )
         
         self.state = ActorState.INIT_MODEL
+    
+    def switch_model(
+        self,
+        vllm_config,
+        checkpoint_path: str | None = None,
+        storage_backend: str = "nfs",
+        storage_config: dict | None = None,
+        weight_transfer_init_info: dict | None = None,
+    ) -> None:
+        """
+        Switch to a new model (hot-switching).
+        
+        Releases the current model and KV cache, rebuilds the worker with
+        the new vllm_config, then loads the new weights from the chosen
+        source. MessageQueues are retained (they are owned by the executor)
+        and the distributed environment is reused when world_size is
+        unchanged (init_distributed_environment is idempotent).
+        
+        Args:
+            vllm_config: New vLLM configuration
+            checkpoint_path: Checkpoint path for storage loading (optional)
+            storage_backend: Storage backend name ("nfs" or "mooncake")
+            storage_config: Backend-specific configuration
+            weight_transfer_init_info: Weight transfer init info (optional)
+        
+        Raises:
+            RuntimeError: If the worker has not been initialized
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if self.worker is None or self.vllm_config is None:
+            raise RuntimeError(
+                "Worker not initialized, cannot switch model"
+            )
+        
+        logger.info(
+            f"Switching model on worker {self._rank} (device {self.device_id})"
+        )
+        
+        # 1. Release the current model and KV cache (keep device binding)
+        self.worker.shutdown()
+        self.worker = None
+        self.state = ActorState.RELEASED
+        
+        # 2. Rebuild worker with the new config (reuse saved init kwargs)
+        from vllm.v1.worker.worker_base import WorkerWrapperBase
+        
+        self.vllm_config = vllm_config
+        wrapper = WorkerWrapperBase(
+            rpc_rank=self._local_rank, global_rank=self._rank
+        )
+        wrapper.init_worker(all_kwargs=[{
+            "vllm_config": vllm_config,
+            "local_rank": self._local_rank,
+            "rank": self._rank,
+            "distributed_init_method": self._dist_init_method,
+            "is_driver_worker": self._is_driver_worker,
+        }])
+        self.worker = wrapper
+        
+        # 3. Re-initialize device. init_distributed_environment is
+        #    idempotent (skips PG init when already initialized), and
+        #    ensure_model_parallel_initialized no-ops for existing groups,
+        #    so this is safe for the same-world_size hot-switch.
+        self.worker.init_device()
+        
+        # 4. Load the new model weights
+        if checkpoint_path is not None:
+            self.load_model_from_storage(
+                checkpoint_path, storage_backend, storage_config
+            )
+        elif weight_transfer_init_info is not None:
+            self.load_model_via_weight_transfer(weight_transfer_init_info)
+        else:
+            logger.warning(
+                "No weight source given for switch_model, using dummy "
+                "weights (structure only)"
+            )
+            self.worker.load_model(load_dummy_weights=True)
+        
+        self.state = ActorState.INIT_MODEL
+        logger.info(
+            f"Worker {self._rank} switched to new model successfully"
+        )
     
     def initialize_kv_cache(self, kv_cache_config) -> None:
         """
@@ -456,20 +557,29 @@ class ExternalWorkerActor:
             self._execute_worker_rpc(rpc_request)
     
     def _execute_worker_rpc(self, rpc_request) -> None:
-        """Execute an RPC request."""
+        """Execute an RPC request.
+        
+        Follows vLLM's standard output_rank semantics (see
+        MultiprocExecutor._execute_worker_rpc): the result is only sent
+        when output_rank is None (all workers reply) or this worker is
+        the target (rank == output_rank).
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         method, args, kwargs, output_rank = rpc_request
         
         try:
             result = getattr(self.worker, method)(*args, **kwargs)
             
             # Send response
-            if output_rank is not None:
+            if output_rank is None or self._rank == output_rank:
                 self.worker_response_mq.enqueue((True, result))
-            else:
-                self.worker_response_mq.enqueue((True, None))
                 
         except Exception as e:
-            self.worker_response_mq.enqueue((False, str(e)))
+            logger.exception("Worker RPC failed: %s", method)
+            if output_rank is None or self._rank == output_rank:
+                self.worker_response_mq.enqueue((False, str(e)))
     
     def reset(self) -> None:
         """
