@@ -161,10 +161,38 @@ llm = LLM(
 
 ## 安装
 
+### 版本要求
+
+本插件**不是纯 Python 插件**：它依赖对 vLLM 引擎调用链的私有补丁
+（`external_actors` 参数从 `AsyncLLM` 一路透传到 `EngineCore` → executor），
+该补丁**尚未合入上游 vLLM**，目前只存在于 fork 的
+`feature/external-executor` 分支。
+
+> ⚠️ 不要使用 PyPI 上的 `vllm` 包 —— 它没有 `external_actors` 参数，
+> 运行时会抛出 `TypeError: unexpected keyword argument 'external_actors'`。
+
+| 依赖 | 要求 |
+|------|------|
+| vLLM | **≥ v0.28.0**（V1 `RayExecutorV2` / `initialize_from_config` 等 API 的稳定基线） |
+| 安装源 | `github.com/ventsing/vllm` 的 `feature/external-executor` 分支（当前基线 `v0.28.1rc0`） |
+
+### 安装步骤
+
 ```bash
-cd vllm/multi-task-infer
+# 1. 从打了补丁的 fork 源码安装 vLLM（vLLM 需编译，多核更快）
+git clone https://github.com/ventsing/vllm.git
+cd vllm
+git checkout feature/external-executor
+pip install -e . --no-build-isolation
+
+# 2. 安装插件子包（注册 vllm.general_plugins 入口点，vLLM 启动时自动加载）
+cd multi-task-infer
 pip install -e .
 ```
+
+> 若上游 `dev_main` 更新，需重新确认插件引用的内部 API 签名未变：
+> `get_kv_cache_configs`、`resolve_kv_cache_layout`、
+> `register_all_kvcache_specs`、`initialize_from_config`。
 
 ## 环境变量
 
