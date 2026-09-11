@@ -26,6 +26,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Timeout for the ray.get calls inside a migration, so a dead worker does not
+# hang switch_model/rollback indefinitely.
+_MIGRATION_RPC_TIMEOUT = 60.0
+
 
 class ExternalExecutor(RayExecutorV2):
     """
@@ -77,6 +81,12 @@ class ExternalExecutor(RayExecutorV2):
         """
         self.external_actors = external_actors
         self._cache_manager = cache_manager
+        # Idempotency registry for model migrations (switch_model).
+        from vllm_external_executor.migration import MigrationIdempotencyRegistry
+        self._migration_registry = MigrationIdempotencyRegistry()
+        # Engine-core scheduler gate (injected via set_scheduler_gate).
+        self._migration_pause_fn = None
+        self._migration_resume_fn = None
         
         if external_actors is not None:
             world_size = vllm_config.parallel_config.world_size
@@ -469,20 +479,25 @@ class ExternalExecutor(RayExecutorV2):
         storage_config: dict | None = None,
         weight_transfer_init_info: dict | None = None,
         reinitialize_cache: bool = True,
-    ) -> None:
+        migration_id: str | None = None,
+        flight_batch_policy: str = "drain",
+    ):
         """
-        Switch to a new model (hot-switching).
-        
-        Releases the current model on every worker, rebuilds them with the
-        new vllm_config, and loads the new weights from the chosen source.
-        Optionally re-profiles and re-allocates KV cache, then re-runs the
-        compilation optimization (cache-aware lazy loading).
-        
-        Note: The caller is responsible for ensuring no in-flight inference
-        requests when calling this method (stop scheduling new requests and
-        wait for running requests to finish). The executor cannot safely
-        drain the engine's scheduler from here.
-        
+        Switch to a new model (hot-switching) as an atomic migration.
+
+        Drives a validated state machine
+        (PREPARING -> GRACEFUL_PAUSE -> CHECKPOINT -> UNLOAD -> LOAD ->
+        RESTORE -> COMPLETED) with compensation-based rollback: if any worker
+        fails to switch, the already-switched workers are rolled back to the
+        previous model and the executor config reference is restored, leaving
+        the instance in its pre-migration state (request-level idempotency via
+        ``migration_id``).
+
+        In-flight batches are governed by ``flight_batch_policy``. The vLLM
+        scheduler lives in EngineCore, so the executor surfaces
+        ``set_scheduler_gate`` to let the caller inject the pause/resume
+        coordination; the executor cannot drain the scheduler itself.
+
         Args:
             new_vllm_config: New vLLM configuration. The parallel layout
                 (world_size) must match the current one - actors are bound
@@ -493,45 +508,176 @@ class ExternalExecutor(RayExecutorV2):
             weight_transfer_init_info: Weight transfer init info (optional).
             reinitialize_cache: Whether to re-profile and re-allocate KV
                 cache after the model switch.
+            migration_id: Idempotency key. Reissuing the same id returns the
+                cached result instead of re-running the migration.
+            flight_batch_policy: One of "drain" / "pause_serialize" /
+                "preempt" (see FlightBatchPolicy).
+
+        Returns:
+            MigrationStateMachine describing the terminal outcome.
         """
         import ray
-        
-        parallel_config = new_vllm_config.parallel_config
-        if parallel_config.world_size != self.world_size:
-            raise ValueError(
-                f"switch_model requires world_size to stay constant: "
-                f"current={self.world_size}, new={parallel_config.world_size}. "
-                f"Change TP/PP by releasing actors and acquiring a new set."
+        import uuid
+
+        from vllm_external_executor.migration import (
+            FlightBatchPolicy,
+            MigrationPhase,
+            MigrationSpec,
+        )
+
+        spec = MigrationSpec(
+            migration_id=migration_id or uuid.uuid4().hex,
+            target=getattr(new_vllm_config.model_config, "model", "unknown"),
+            policy=FlightBatchPolicy(flight_batch_policy),
+        )
+
+        def orchestrate(sm):
+            # PREPARING: validate preconditions.
+            sm.transition(MigrationPhase.PREPARING)
+            parallel_config = new_vllm_config.parallel_config
+            if parallel_config.world_size != self.world_size:
+                raise ValueError(
+                    f"switch_model requires world_size to stay constant: "
+                    f"current={self.world_size}, "
+                    f"new={parallel_config.world_size}. "
+                    f"Change TP/PP via release+acquire."
+                )
+
+            # GRACEFUL_PAUSE: hand off to the engine-core scheduler gate.
+            sm.transition(MigrationPhase.GRACEFUL_PAUSE)
+            self._pause_for_migration(sm)
+            # Resume scheduling on BOTH success (explicit call after RESTORE)
+            # and rollback (this compensation runs last), so the scheduler is
+            # never left paused by a failed migration.
+            sm.register_compensation(
+                lambda: self._resume_after_migration(sm)
             )
-        
-        logger.info("Switching model (hot-switching)...")
-        
-        # 1. Update executor-side config reference
-        self.vllm_config = new_vllm_config
-        
-        # 2. Switch model on every worker (parallel ray calls)
-        switch_refs = [
-            handle.actor.switch_model.remote(
+
+            # CHECKPOINT: snapshot executor config + every worker's state.
+            sm.transition(MigrationPhase.CHECKPOINT)
+            old_config = self.vllm_config
+            sm.register_compensation(
+                lambda: setattr(self, "vllm_config", old_config)
+            )
+            snapshots = ray.get(
+                [
+                    h.actor.switch_model_snapshot.remote()
+                    for h in self.ray_worker_handles
+                ],
+                timeout=_MIGRATION_RPC_TIMEOUT,
+            )
+
+            # UNLOAD + LOAD: switch every worker, with per-worker rollback.
+            sm.transition(MigrationPhase.UNLOAD)
+            self._switch_all_workers(
+                new_vllm_config,
+                checkpoint_path,
+                storage_backend,
+                storage_config,
+                weight_transfer_init_info,
+                snapshots,
+                sm,
+            )
+            sm.transition(MigrationPhase.LOAD)
+
+            # RESTORE: re-allocate KV cache + compile, then resume.
+            sm.transition(MigrationPhase.RESTORE)
+            if reinitialize_cache:
+                self._reinitialize_kv_cache()
+            self._handle_compilation_optimization()
+            self._resume_after_migration(sm)
+
+            sm.transition(MigrationPhase.COMPLETED)
+            logger.info("Model switch complete (%s)", sm.progress())
+
+        return self._migration_registry.run(spec, orchestrate)
+
+    def _switch_all_workers(
+        self,
+        new_vllm_config: VllmConfig,
+        checkpoint_path: str | None,
+        storage_backend: str,
+        storage_config: dict | None,
+        weight_transfer_init_info: dict | None,
+        snapshots: list[dict],
+        sm,
+    ) -> None:
+        """Fan out worker switches and roll back successes on partial failure.
+
+        All workers are launched in parallel; results are collected one by one
+        so a partial failure can be compensated precisely. On failure, the
+        already-switched workers are rolled back to their snapshots and the
+        error is re-raised to drive the state machine's rollback.
+        """
+        import ray
+
+        refs = [
+            h.actor.switch_model.remote(
                 vllm_config=new_vllm_config,
                 checkpoint_path=checkpoint_path,
                 storage_backend=storage_backend,
                 storage_config=storage_config,
                 weight_transfer_init_info=weight_transfer_init_info,
             )
-            for handle in self.ray_worker_handles
+            for h in self.ray_worker_handles
         ]
-        ray.get(switch_refs)
+
+        switched: list[tuple] = []  # (handle, snapshot)
+        errors: list[str] = []
+        for i, ref in enumerate(refs):
+            try:
+                ray.get(ref, timeout=_MIGRATION_RPC_TIMEOUT)
+                switched.append((self.ray_worker_handles[i], snapshots[i]))
+            except Exception as e:  # noqa: BLE001 - collect all failures
+                errors.append(f"worker {i}: {e}")
+
+        if errors:
+            def rollback_workers():
+                for handle, snap in switched:
+                    try:
+                        ray.get(
+                            handle.actor.switch_model_rollback.remote(snap),
+                            timeout=_MIGRATION_RPC_TIMEOUT,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.error("Worker rollback failed: %s", e)
+
+            sm.register_compensation(rollback_workers)
+            raise RuntimeError("; ".join(errors))
+
         logger.info("All workers switched to the new model")
-        
-        # 3. Re-initialize KV cache (profile available memory and allocate)
-        if reinitialize_cache:
-            self._reinitialize_kv_cache()
-        
-        # 4. Compilation optimization (cache-aware lazy loading)
-        self._handle_compilation_optimization()
-        
-        logger.info("Model switch complete")
-    
+
+    def _pause_for_migration(self, sm) -> None:
+        """Invoke the engine-core scheduler gate for the migration pause.
+
+        The vLLM scheduler runs in EngineCore, not in this executor, so this
+        is a coordination point: if the caller registered a pause callback via
+        :meth:`set_scheduler_gate`, it is invoked with the flight-batch policy.
+        """
+        if self._migration_pause_fn is not None:
+            self._migration_pause_fn(sm.spec.policy)
+        else:
+            logger.info(
+                "No scheduler gate registered; assuming caller paused "
+                "scheduling (policy=%s)", sm.spec.policy.value,
+            )
+
+    def _resume_after_migration(self, sm) -> None:
+        """Invoke the engine-core scheduler gate to resume scheduling."""
+        if self._migration_resume_fn is not None:
+            self._migration_resume_fn()
+
+    def set_scheduler_gate(self, pause_fn, resume_fn) -> None:
+        """Register engine-core callbacks for scheduler pause/resume.
+
+        Args:
+            pause_fn: ``callable(FlightBatchPolicy) -> None`` invoked at
+                GRACEFUL_PAUSE to stop scheduling / drain or freeze batches.
+            resume_fn: ``callable() -> None`` invoked after RESTORE.
+        """
+        self._migration_pause_fn = pause_fn
+        self._migration_resume_fn = resume_fn
+
     def _reinitialize_kv_cache(self) -> None:
         """
         Re-profile available GPU memory and re-allocate KV cache.

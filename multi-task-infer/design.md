@@ -415,6 +415,35 @@ class GlobalScheduler:
         """优先级: 硬约束 > 故障域 spread > 负载均衡 > driver 就近"""
 ```
 
+### 1.3.6 迁移状态机 / 事务 / 幂等
+
+```python
+class MigrationPhase(str, Enum):
+    IDLE, PREPARING, GRACEFUL_PAUSE, CHECKPOINT, UNLOAD, LOAD,
+    RESTORE, COMPLETED, FAILED, ROLLING_BACK, ROLLED_BACK
+
+
+class FlightBatchPolicy(str, Enum):
+    """飞行中 batch 处理策略（需与 EngineCore 调度器协同）。"""
+    DRAIN = "drain"                       # 完成当前步再迁移（最安全，默认）
+    PAUSE_SERIALIZE = "pause_serialize"   # 暂停 + 序列化调度状态
+    PREEMPT = "preempt"                   # 抢占式中断 + 请求级重放
+
+
+class MigrationStateMachine:
+    """校验状态转换 + 补偿式回滚（纯逻辑）。"""
+    def transition(self, next_phase) -> None: ...      # 非法跳转抛异常
+    def register_compensation(self, handler) -> None:  # 每步成功后注册补偿
+    def fail(self, error) -> None: ...
+    def rollback(self) -> MigrationOutcome: ...        # 逆序执行补偿(幂等)
+
+
+class MigrationIdempotencyRegistry:
+    """请求级幂等: 同一 migration_id 只执行一次，重发返回缓存结果。"""
+    def run(self, spec, execute_fn) -> MigrationStateMachine: ...
+    def get(self, migration_id) -> MigrationStateMachine | None: ...
+```
+
 ---
 
 # 2. 进程视图（Process View）
@@ -788,6 +817,7 @@ multi-task-infer/                            # ⭐ 新增: 独立插件包 (G5 �
 │   ├── cache_manager_actor.py         # ⭐ CacheManagerActor (G6)
 │   ├── cluster_state.py               # ⭐ NodeInfo / ActorRegistration / GlobalScheduler
 │   ├── node_registry_actor.py         # ⭐ NodeRegistryActor (注册/心跳/统一视图/死检测)
+│   ├── migration.py                   # ⭐ 迁移状态机 + 事务 + 幂等 + FlightBatchPolicy
 │   └── storage_checkpoint_engine.py   # ⭐ StorageCheckpointEngine + StorageBackend (G7)
 ├── examples/
 │   ├── basic_usage.py                 # 使用示例
@@ -795,6 +825,7 @@ multi-task-infer/                            # ⭐ 新增: 独立插件包 (G5 �
 │   └── mooncake_config.json           # Mooncake 配置模板
 ├── tests/
 │   ├── test_global_scheduler.py       # 测试: 故障域感知调度
+│   ├── test_migration.py              # 测试: 迁移状态机 + 事务 + 幂等
 │   └── test_storage_checkpoint_engine.py   # 测试: nfs / mooncake_mock / mooncake
 ├── README.md                          # 使用文档
 ├── STORAGE_CHECKPOINT_ENGINE_DESIGN.md
@@ -1016,17 +1047,19 @@ class EngineCore:
 |------|------|---------|
 | `multi-task-infer/pyproject.toml` | 包配置 + vllm.general_plugins 入口点 | ~50 |
 | `vllm_external_executor/__init__.py` | 模块入口 + register_plugin() | ~123 |
-| `vllm_external_executor/external_executor.py` | ExternalExecutor 实现（G1/G4） | ~578 |
-| `vllm_external_executor/actor_pool_manager.py` | ActorPoolManager 实现（G1/G2 + 分布式能力） | ~712 |
-| `vllm_external_executor/external_worker_actor.py` | ExternalWorkerActor 实现 | ~652 |
+| `vllm_external_executor/external_executor.py` | ExternalExecutor 实现（G1/G4 + 迁移状态机） | ~718 |
+| `vllm_external_executor/actor_pool_manager.py` | ActorPoolManager 实现（G1/G2 + 分布式 + 迁移） | ~849 |
+| `vllm_external_executor/external_worker_actor.py` | ExternalWorkerActor 实现 | ~693 |
 | `vllm_external_executor/cluster_state.py` | NodeInfo / ActorRegistration / GlobalScheduler（纯逻辑） | ~272 |
 | `vllm_external_executor/node_registry_actor.py` | NodeRegistryActor：注册/心跳/统一视图/死检测 | ~279 |
+| `vllm_external_executor/migration.py` | 迁移状态机 + 原子事务 + 幂等 + FlightBatchPolicy | ~313 |
 | `vllm_external_executor/cache_manager_actor.py` | CacheManagerActor 实现（G6） | ~474 |
 | `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~884 |
 | `examples/basic_usage.py` | 使用示例 | ~223 |
 | `examples/verify_multi_task_sharing.py` | 多任务共享验证脚本 | ~369 |
 | `examples/mooncake_config.json` | Mooncake 配置模板 | ~10 |
 | `tests/test_global_scheduler.py` | 测试：GlobalScheduler 故障域调度 | ~137 |
+| `tests/test_migration.py` | 测试：迁移状态机 + 事务 + 幂等 | ~151 |
 | `tests/test_storage_checkpoint_engine.py` | 测试：nfs / mooncake_mock / mooncake | ~483 |
 | `verify_dependencies.sh` | 依赖验证脚本 | ~120 |
 
@@ -1390,46 +1423,69 @@ vLLM 核心修改（最小侵入，G5）：
 
 ## 5.3 场景 3：模型热切换
 
-> ✅ **实现状态：已实现**。`ExternalWorkerActor.switch_model()` 在 worker 侧
-> 重建模型并加载权重（存储加载 G7 首选 / weight_transfer 备选 / dummy 兜底）；
-> `ExternalExecutor.switch_model()` 负责 world_size 校验、并行下发、
-> KV cache 重分配（`_reinitialize_kv_cache`）与编译缓存懒加载。
-> 调用方需保证切换时无 in-flight 推理请求。
+> ✅ **实现状态：已实现（迁移状态机 + 原子事务 + 幂等）**。
+> `ExternalExecutor.switch_model()` 用 `MigrationStateMachine` 驱动
+> PREPARING → GRACEFUL_PAUSE → CHECKPOINT → UNLOAD → LOAD → RESTORE →
+> COMPLETED；`migration_id` 保证请求级幂等；任一 worker 切换失败触发
+> 补偿回滚（已切换 worker 通过 `switch_model_rollback` 重载旧模型、
+> executor 配置引用恢复），原子回到迁移前状态。飞行中 batch 由
+> `FlightBatchPolicy`（drain / pause_serialize / preempt）+ `set_scheduler_gate`
+> 与 EngineCore 调度器协同。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  场景: 模型热切换                                                                │
-│  参与者: 用户, ExternalExecutor, Actors, StorageCheckpointEngine / weight_transfer│
+│  场景: 模型热切换（迁移状态机 + 原子事务）                                        │
+│  参与者: 用户, ExternalExecutor, EngineCore(调度器), Actors, StorageBackend       │
 │                                                                                  │
 │  前置条件: vLLM 实例正在运行模型 A，需要切换到模型 B                              │
-│            (world_size 不变; 无 in-flight 请求)                                  │
+│            (world_size 不变; 飞行中 batch 按策略处理)                             │
 │                                                                                  │
-│  主流程:                                                                         │
-│  1. 用户调用 executor.switch_model(new_vllm_config, checkpoint_path, backend)    │
-│  2. ExternalExecutor 校验 world_size 一致                                        │
-│  3. 并行下发 actor.switch_model(vllm_config, ...) 到所有 Worker                  │
-│     a. worker.shutdown() → 释放模型 A 权重和 KV Cache (state=RELEASED)          │
-│     b. 用新 vllm_config 重建 WorkerWrapperBase (复用 MQ 与分布式环境)            │
-│     c. init_device() (PG 幂等, 已初始化则跳过)                                   │
-│     d. 加载模型 B 权重:                                                         │
-│        - 【首选 G7】load_model_from_storage (NFS / Mooncake Store)              │
-│        - 【备选】load_model_via_weight_transfer (NCCL/IPC/sharded_rdt)          │
-│        - 【兜底】dummy weights                                                    │
-│  4. _reinitialize_kv_cache(): 重新 profiling 可用内存并分配 KV cache            │
-│  5. _handle_compilation_optimization(): 编译缓存懒加载 (见场景 6)               │
-│  6. 恢复推理                                                                    │
+│  状态机主流程:                                                                   │
+│  ① PREPARING     校验 world_size / migration_id 幂等去重                        │
+│  ② GRACEFUL_PAUSE 调用 set_scheduler_gate 注入的 pause 回调                     │
+│                   (DRAIN=排空 / PAUSE_SERIALIZE=冻结序列化 / PREEMPT=抢占中断)   │
+│  ③ CHECKPOINT    保存旧 vllm_config + 各 worker switch_model_snapshot()         │
+│                   注册补偿: 恢复 config + 重载旧模型                             │
+│  ④ UNLOAD + LOAD 并行切换所有 worker; 逐个收集结果                              │
+│                   部分失败 → 对已切换 worker switch_model_rollback(snapshot)    │
+│  ⑤ RESTORE       _reinitialize_kv_cache() + 编译缓存懒加载 + resume 回调         │
+│  ⑥ COMPLETED     终端态; 或 FAILED → ROLLING_BACK → ROLLED_BACK(原子回滚)      │
 │                                                                                  │
-│  后置条件: vLLM 实例已切换到模型 B，可以处理推理请求                              │
+│  事务性:                                                                         │
+│  - 迁移失败自动回滚到迁移前状态（请求级幂等，重复 migration_id 直接返回结果）     │
+│  - FlightBatchPolicy:                                                            │
+│    · DRAIN           完成当前步再迁移（最安全，默认）                             │
+│    · PAUSE_SERIALIZE 暂停并序列化调度状态，迁移后确定性恢复                       │
+│    · PREEMPT         抢占式中断 + 请求级重放（需前端幂等）                        │
 │                                                                                  │
-│  耗时: ~10-60s (相比重新创建实例 68-495s 大幅减少)                              │
+│  后置条件: vLLM 实例已切换到模型 B（或原子回滚到模型 A），可处理推理请求          │
+│                                                                                  │
+│  耗时: ~10-60s（回滚另需重载旧模型 ~同量级）                                     │
 │                                                                                  │
 │  涉及的视图:                                                                     │
-│  - 逻辑视图: ExternalExecutor.switch_model(), ExternalWorkerActor.switch_model() │
-│  - 进程视图: 模型卸载、权重加载、KV Cache 重新分配                                │
-│  - 开发视图: vllm_external_executor/external_executor.py,                        │
-│             vllm_external_executor/storage_checkpoint_engine.py                  │
+│  - 逻辑视图: MigrationStateMachine, ExternalExecutor.switch_model(),             │
+│             ExternalWorkerActor.switch_model_snapshot/rollback()                 │
+│  - 进程视图: 调度器暂停/恢复、模型卸载、权重加载、KV Cache 重新分配、补偿回滚     │
+│  - 开发视图: vllm_external_executor/migration.py, external_executor.py,          │
+│             external_worker_actor.py, storage_checkpoint_engine.py               │
 │  - 物理视图: StorageBackend (NFS/Mooncake) / weight_transfer 通信                │
 └─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 5.3.1 场景 3b：跨节点 Actor 迁移（原子 build-before-swap）
+
+> `ActorPoolManager.migrate_actor()` 实现主动迁移：先建后换（build 新 Actor
+> → 注册 → 原子切换本地映射 → 最后才 kill 旧 Actor），失败时旧 Actor 完好，
+> 回滚无损。区别于 `rebuild_actor()`（先 kill 后建，用于死节点故障恢复）。
+
+```
+  ① PREPARING    校验 actor_id 存在、非 LEASED/RUNNING
+  ② GRACEFUL_PAUSE 心跳确认旧 actor 健康（DRAIN 语义）
+  ③ CHECKPOINT   记录旧 handle/registration
+  ④ UNLOAD       在目标节点 build 新 Actor（NodeAffinity 调度）
+  ⑤ LOAD         注册新 actor + 原子更新本地映射（build-before-swap）
+  ⑥ RESTORE      仅此刻 kill 旧 actor + 注销旧注册（swap 已提交）
+  ⑦ COMPLETED    幂等（migration_id 去重）；中途失败 → 旧 actor 仍在 → 无损回滚
 ```
 
 ## 5.4 场景 4：弹性伸缩（TP/PP 变化）

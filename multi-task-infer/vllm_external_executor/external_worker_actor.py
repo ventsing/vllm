@@ -91,6 +91,12 @@ class ExternalWorkerActor:
         self._is_driver_worker: bool = False
         self._is_driver_node: bool = False
         
+        # Active weight source (for migration rollback: re-load the previous
+        # model after a failed switch).
+        self._active_checkpoint_path: str | None = None
+        self._active_storage_backend: str = "nfs"
+        self._active_storage_config: dict | None = None
+        
         # Message queues (set during initialize_worker)
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
@@ -458,6 +464,11 @@ class ExternalWorkerActor:
             f"Loaded {loaded_count} parameters from storage checkpoint"
         )
         
+        # Record the active weight source for migration rollback.
+        self._active_checkpoint_path = checkpoint_path
+        self._active_storage_backend = storage_backend
+        self._active_storage_config = storage_config
+        
         self.state = ActorState.INIT_MODEL
     
     def switch_model(
@@ -539,10 +550,40 @@ class ExternalWorkerActor:
                 "weights (structure only)"
             )
             self.worker.load_model(load_dummy_weights=True)
+            self._active_checkpoint_path = None
+            self._active_storage_backend = "nfs"
+            self._active_storage_config = None
         
         self.state = ActorState.INIT_MODEL
         logger.info(
             f"Worker {self._rank} switched to new model successfully"
+        )
+    
+    def switch_model_snapshot(self) -> dict:
+        """Capture the pre-migration state for atomic rollback.
+
+        Returns the current config and weight source, sufficient for
+        :meth:`switch_model_rollback` to re-load the previous model after a
+        failed switch.
+        """
+        return {
+            "vllm_config": self.vllm_config,
+            "checkpoint_path": self._active_checkpoint_path,
+            "storage_backend": self._active_storage_backend,
+            "storage_config": self._active_storage_config,
+        }
+    
+    def switch_model_rollback(self, snapshot: dict) -> None:
+        """Rollback a failed switch by re-loading the previous model.
+
+        Reuses :meth:`switch_model` with the snapshot's config and weight
+        source, undoing the worker-side effects of the failed switch.
+        """
+        self.switch_model(
+            vllm_config=snapshot["vllm_config"],
+            checkpoint_path=snapshot["checkpoint_path"],
+            storage_backend=snapshot["storage_backend"],
+            storage_config=snapshot["storage_config"],
         )
     
     def initialize_kv_cache(self, kv_cache_config) -> None:
