@@ -626,6 +626,23 @@ class BlockPool:
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
 
+    def import_block_hashes(
+        self,
+        block_id_to_hash: dict[int, BlockHashWithGroupId],
+    ) -> None:
+        """Register externally-written blocks into the prefix-cache index.
+
+        Used by incremental KV migration: the data plane has already copied the
+        KV tensors for ``block_id`` into the GPU cache; this restores the
+        scheduler-side prefix-cache metadata so subsequent requests can hit
+        those blocks. Idempotent for already-registered hashes.
+
+        Args:
+            block_id_to_hash: Maps physical block id to its ``BlockHashWithGroupId``.
+        """
+        for block_id, block_hash in block_id_to_hash.items():
+            self._insert_block_hash(block_hash, self.blocks[block_id], num_tokens=None)
+
     def move_block_hashes(
         self,
         src_block: KVCacheBlock,
