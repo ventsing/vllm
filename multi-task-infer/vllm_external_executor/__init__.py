@@ -52,6 +52,14 @@ from vllm_external_executor.node_registry_actor import (
     NodeRegistryActor,
     create_registry_actor,
 )
+from vllm_external_executor.migration import (
+    FlightBatchPolicy,
+    MigrationIdempotencyRegistry,
+    MigrationOutcome,
+    MigrationPhase,
+    MigrationSpec,
+    MigrationStateMachine,
+)
 from vllm_external_executor.storage_checkpoint_engine import (
     StorageCheckpointEngine,
     StorageBackend,
@@ -77,6 +85,12 @@ __all__ = [
     "NodeInfo",
     "NodeRegistryActor",
     "create_registry_actor",
+    "FlightBatchPolicy",
+    "MigrationIdempotencyRegistry",
+    "MigrationOutcome",
+    "MigrationPhase",
+    "MigrationSpec",
+    "MigrationStateMachine",
     "StorageCheckpointEngine",
     "StorageBackend",
     "StorageBackendFactory",

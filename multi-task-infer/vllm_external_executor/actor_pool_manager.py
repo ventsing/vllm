@@ -94,6 +94,10 @@ class ActorPoolManager:
         # Active leases: lease_id -> [actor_id] (for future accounting).
         self._leases: dict[str, list[str]] = {}
 
+        # Idempotency registry for actor migrations (migrate_actor).
+        from vllm_external_executor.migration import MigrationIdempotencyRegistry
+        self._migration_registry = MigrationIdempotencyRegistry()
+
     # ==================================================================== start
     def pre_start(
         self,
@@ -568,6 +572,139 @@ class ActorPoolManager:
         except Exception as e:
             logger.error("Failed to rebuild actor %s: %s", actor_id, e)
             return None
+
+    def migrate_actor(
+        self,
+        actor_id: str,
+        target_node_id: str | None = None,
+        migration_id: str | None = None,
+    ):
+        """
+        Migrate a healthy actor across nodes atomically (state machine).
+
+        Unlike :meth:`rebuild_actor` (which kills first, for dead-actor
+        recovery), this is the *proactive* migration path and follows
+        "build-before-swap": a replacement actor is created and registered
+        first, then the local pool is atomically switched to it, and only then
+        is the old actor killed. A failure before the swap leaves the original
+        actor untouched, so the migration rolls back cleanly.
+
+        Phases: PREPARING -> GRACEFUL_PAUSE -> CHECKPOINT -> UNLOAD (build)
+        -> LOAD (swap) -> RESTORE (kill old) -> COMPLETED. Idempotent on
+        ``migration_id``.
+        """
+        import ray
+        import uuid
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        from vllm_external_executor.migration import (
+            FlightBatchPolicy,
+            MigrationPhase,
+            MigrationSpec,
+        )
+
+        spec = MigrationSpec(
+            migration_id=migration_id or uuid.uuid4().hex,
+            target=f"actor:{actor_id}",
+            policy=FlightBatchPolicy.DRAIN,
+        )
+
+        def orchestrate(sm):
+            sm.transition(MigrationPhase.PREPARING)
+            reg = self._actor_regs.get(actor_id)
+            if reg is None:
+                raise ValueError(f"Unknown actor id {actor_id}")
+            old_idx = self._actor_id_to_idx.get(actor_id)
+
+            sm.transition(MigrationPhase.GRACEFUL_PAUSE)
+            if old_idx is not None and self.states.get(old_idx) in (
+                ActorState.LEASED, ActorState.RUNNING,
+            ):
+                raise RuntimeError(
+                    f"Actor {actor_id} is leased/running; release it before "
+                    f"migrating"
+                )
+
+            sm.transition(MigrationPhase.CHECKPOINT)
+            old_handle = self.actors[old_idx] if old_idx is not None else None
+
+            # Build the replacement on the target node (build-before-swap).
+            sm.transition(MigrationPhase.UNLOAD)
+            options = {"num_gpus": 1}
+            if target_node_id:
+                options["scheduling_strategy"] = (
+                    NodeAffinitySchedulingStrategy(
+                        node_id=target_node_id, soft=False
+                    )
+                )
+            new_actor = ray.remote(ExternalWorkerActor).options(**options).remote(
+                device_id=reg["device_id"],
+                warmup_distributed=bool(reg.get("warmup_distributed", True)),
+            )
+            ray.get(new_actor.wait_for_ready.remote(), timeout=RPC_TIMEOUT)
+            info = ray.get(new_actor.get_info.remote(), timeout=RPC_TIMEOUT)
+            new_node_id = info["node_id"]
+            new_id = f"{new_node_id}-g{reg['device_id']}-{uuid.uuid4().hex[:8]}"
+            domain = reg["fault_domain"]
+
+            # Swap into the pool (LOAD): update local maps + registry.
+            sm.transition(MigrationPhase.LOAD)
+            ray.get(
+                new_actor.configure_pool_identity.remote(new_id, domain),
+                timeout=RPC_TIMEOUT,
+            )
+            ray.get(
+                self.registry.register_actor.remote(
+                    actor_id=new_id,
+                    node_id=new_node_id,
+                    device_id=reg["device_id"],
+                    fault_domain=domain,
+                ),
+                timeout=RPC_TIMEOUT,
+            )
+            if old_idx is not None:
+                self.actors[old_idx] = new_actor
+                self.states[old_idx] = ActorState.IDLE
+                idx = old_idx
+            else:
+                idx = len(self.actors)
+                self.actors.append(new_actor)
+                self.states[idx] = ActorState.IDLE
+            self.actor_ids[idx] = new_id
+            self._actor_id_to_idx.pop(actor_id, None)
+            self._actor_id_to_idx[new_id] = idx
+            self._actor_regs[new_id] = dict(reg)
+            self._actor_regs[new_id]["node_id"] = new_node_id
+            self._actor_regs.pop(actor_id, None)
+            self.node_mapping.setdefault(new_node_id, []).append(idx)
+            if old_idx is not None:
+                old_node = reg.get("node_id")
+                node_actors = self.node_mapping.get(old_node, [])
+                if old_idx in node_actors:
+                    node_actors.remove(old_idx)
+
+            # RESTORE: only now retire the old actor (swap is committed).
+            sm.transition(MigrationPhase.RESTORE)
+            if old_handle is not None:
+                try:
+                    ray.get(
+                        self.registry.unregister_actor.remote(actor_id),
+                        timeout=RPC_TIMEOUT,
+                    )
+                except Exception:
+                    pass
+                try:
+                    ray.kill(old_handle)
+                except Exception:
+                    pass
+
+            sm.transition(MigrationPhase.COMPLETED)
+            logger.info(
+                "Migrated actor %s -> %s on node %s (%s)",
+                actor_id, new_id, new_node_id, sm.progress(),
+            )
+
+        return self._migration_registry.run(spec, orchestrate)
 
     # ================================================================ heartbeat
     def _start_heartbeat(self) -> None:
