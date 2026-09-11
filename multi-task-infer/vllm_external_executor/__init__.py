@@ -43,6 +43,15 @@ from vllm_external_executor.cache_manager_actor import (
     extract_cache_to_local,
     local_cache_exists,
 )
+from vllm_external_executor.cluster_state import (
+    ActorRegistration,
+    GlobalScheduler,
+    NodeInfo,
+)
+from vllm_external_executor.node_registry_actor import (
+    NodeRegistryActor,
+    create_registry_actor,
+)
 from vllm_external_executor.storage_checkpoint_engine import (
     StorageCheckpointEngine,
     StorageBackend,
@@ -63,6 +72,11 @@ __all__ = [
     "package_local_cache",
     "extract_cache_to_local",
     "local_cache_exists",
+    "ActorRegistration",
+    "GlobalScheduler",
+    "NodeInfo",
+    "NodeRegistryActor",
+    "create_registry_actor",
     "StorageCheckpointEngine",
     "StorageBackend",
     "StorageBackendFactory",

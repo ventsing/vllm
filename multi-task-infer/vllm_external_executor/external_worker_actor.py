@@ -46,6 +46,8 @@ class ExternalWorkerActor:
         self,
         device_id: int,
         warmup_distributed: bool = True,
+        actor_id: str | None = None,
+        fault_domain: str | None = None,
     ):
         """
         Initialize the ExternalWorkerActor.
@@ -53,10 +55,15 @@ class ExternalWorkerActor:
         Args:
             device_id: The GPU/NPU device ID to bind to
             warmup_distributed: Whether to warm up NCCL/HCCl at init time
+            actor_id: Stable pool-level id (``{node_id}-gpu{device_id}`` when
+                omitted); used by the central registry for heartbeat/rebuild.
+            fault_domain: Failure-domain label inherited from the host node.
         """
         # 1. Bind to device
         self.device_id = device_id
         self.device = torch.device(f"cuda:{device_id}")
+        self.actor_id = actor_id
+        self.fault_domain = fault_domain
         
         # Set device for this process
         if torch.cuda.is_available():
@@ -147,9 +154,11 @@ class ExternalWorkerActor:
         import ray
         
         return {
+            "actor_id": self.actor_id,
             "device_id": self.device_id,
             "node_id": ray.get_runtime_context().get_node_id(),
             "physical_gpu_ids": [self.device_id],
+            "fault_domain": self.fault_domain,
             "state": self.state.value,
         }
     
@@ -158,16 +167,53 @@ class ExternalWorkerActor:
         Get actor information for pool management.
         
         Returns:
-            Dictionary with device_id, node_id, physical_gpu_ids, state
+            Dictionary with actor_id, device_id, node_id, physical_gpu_ids,
+            fault_domain, state
         """
         import ray
         
         return {
+            "actor_id": self.actor_id,
             "device_id": self.device_id,
             "node_id": ray.get_runtime_context().get_node_id(),
             "physical_gpu_ids": [self.device_id],
+            "fault_domain": self.fault_domain,
             "state": self.state.value,
         }
+    
+    def heartbeat(self) -> dict:
+        """
+        Return a lightweight liveness + status probe.
+
+        Used by the pool manager's heartbeat thread and by the central
+        registry to detect dead actors without importing vLLM internals.
+        """
+        import ray
+        import time
+        
+        return {
+            "actor_id": self.actor_id,
+            "node_id": ray.get_runtime_context().get_node_id(),
+            "device_id": self.device_id,
+            "fault_domain": self.fault_domain,
+            "state": self.state.value,
+            "timestamp": time.time(),
+        }
+    
+    def configure_pool_identity(
+        self,
+        actor_id: str,
+        fault_domain: str | None = None,
+    ) -> None:
+        """Stabilize pool-level identity after node discovery.
+
+        The node id is only known once the actor is running, so the pool
+        manager calls this once during ``pre_start`` to backfill a stable id
+        (used by the registry) and the failure-domain label.
+        """
+        self.actor_id = actor_id
+        if fault_domain is not None:
+            self.fault_domain = fault_domain
     
     def get_node_and_physical_gpu_ids(self) -> tuple:
         """
