@@ -182,6 +182,17 @@ vLLM 的 Executor 体系（UniProcExecutor、MultiprocExecutor、RayExecutorV2�
 │  │                    │  │  - send_weights    │  │  - run()                  │ │
 │  └────────────────────┘  └────────────────────┘  └────────────────────────────┘ │
 │                                                                                  │
+│  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────────┐ │
+│  │ 分布式控制面        │  │ 全局调度器          │  │  节点故障隔离              │ │
+│  │  ────────────────  │  │  ────────────────  │  │  ────────────────────────  │ │
+│  │                    │  │                    │  │                            │ │
+│  │  NodeRegistryActor │  │  GlobalScheduler   │  │  - 心跳线程                │ │
+│  │  - register_node   │  │  - select_actors   │  │  - detect_dead_*           │ │
+│  │  - register_actor  │  │  - 故障域 spread   │  │  - recover_node            │ │
+│  │  - heartbeat       │  │  - 硬约束/负载均衡 │  │  - rebuild_actor           │ │
+│  │  - get_global_view │  │  - driver 就近     │  │  - RPC_TIMEOUT             │ │
+│  └────────────────────┘  └────────────────────┘  └────────────────────────────┘ │
+│                                                                                  │
 │  ┌────────────────────┐                                                         │
 │  │  通信层 (复用)      │                                                         │
 │  │  ────────────────  │                                                         │
@@ -207,25 +218,44 @@ class ActorPoolManager:
         num_actors: int,
         devices_per_node: list[int],
         placement_group: PlacementGroup | None = None,
+        registry: NodeRegistryActor | None = None,   # 共享全局注册表
+        fault_domain: str | None = None,             # 故障域标签(默认=node_id)
+        strategy: str = "pack",                       # "pack" | "spread"
+        heartbeat_interval: float = 5.0,
+        heartbeat_timeout: float = 30.0,
     ) -> None:
-        """预启动 Actor 池"""
+        """预启动 Actor 池 + 注册节点/Actor + 启动心跳线程"""
     
     def acquire(
         self,
         tp_size: int,
         pp_size: int,
-        node_constraint: dict[str, int] | None = None,
+        fault_domain_constraint: dict[str, int] | None = None,
+        prefer_driver_node: bool = True,
+        node_constraint: dict[str, int] | None = None,  # 已废弃别名
     ) -> list[ray.actor.ActorHandle]:
-        """获取指定数量的空闲 Actor"""
+        """按故障域 spread 全局调度，获取空闲 Actor"""
     
     def release(self, actors: list[ray.actor.ActorHandle]) -> None:
-        """释放 Actor 回池"""
+        """释放 Actor 回池（ray.get 带 RPC_TIMEOUT）"""
     
     def get_idle_count(self) -> int:
         """获取空闲 Actor 数量"""
     
     def get_actor_states(self) -> dict[int, ActorState]:
         """获取所有 Actor 的状态"""
+    
+    def get_global_view(self) -> dict:
+        """跨节点统一资源视图（每节点空闲 GPU + 故障域分布 + 心跳年龄）"""
+    
+    def check_health(self) -> dict:
+        """检测死节点/死 Actor（心跳超时）"""
+    
+    def recover_node(self, node_id: str) -> list:
+        """节点故障隔离：移除该节点 Actor 并在健康节点重建"""
+    
+    def rebuild_actor(self, actor_id: str, target_node_id: str | None = None):
+        """跨节点迁移：在健康节点等价重建（GPU Actor 无法 live-migrate）"""
 ```
 
 ### 1.3.2 ExternalExecutor 接口
@@ -331,6 +361,58 @@ class NFSStorageBackend(StorageBackend):
 class MooncakeStoreBackend(StorageBackend):
     """Mooncake 后端: MooncakeDistributedStore (RDMA ~9 GB/s on IB)。
     Key 约定: ckpt:{path}:metadata / ckpt:{path}:tensor:{name}"""
+```
+
+### 1.3.5 NodeRegistryActor / GlobalScheduler 接口
+
+```python
+class NodeRegistryActor:
+    """中心化跨节点注册表 (Ray detached actor, 多租户共享)。
+    方法由 Ray actor 模型串行化, 无并发写。"""
+
+    def register_node(self, node_id, ip, fault_domain=None,
+                      total_gpus=0, hostname="") -> None: ...
+    def register_actor(self, actor_id, node_id, device_id,
+                       fault_domain=None) -> None: ...
+    def node_heartbeat(self, node_id) -> None: ...
+    def heartbeat(self, actor_id, state=None) -> bool: ...
+    def set_actor_state(self, actor_id, state, lease_id=None) -> None: ...
+    def unregister_actor(self, actor_id) -> None: ...
+    def unregister_node(self, node_id) -> list[str]: ...
+
+    def list_nodes(self) -> list[NodeInfo]: ...
+    def list_actors(self) -> list[ActorRegistration]: ...
+    def get_global_view(self) -> dict: ...
+        """统一视图: 每节点 free/total GPU + 每故障域分布 + 心跳年龄"""
+
+    def detect_dead_actors(self, timeout) -> list[str]: ...
+    def detect_dead_nodes(self, timeout) -> list[str]: ...
+    def mark_node_failed(self, node_id) -> list[str]: ...
+        """节点故障: 移除节点及其 Actor, 返回 actor ids 供重建"""
+    def mark_actor_failed(self, actor_id) -> None: ...
+
+
+@dataclass
+class NodeInfo:
+    node_id: str; ip: str; fault_domain: str
+    total_gpus: int; free_gpus: int
+    hostname: str = ""; last_heartbeat: float = ...
+
+
+@dataclass
+class ActorRegistration:
+    actor_id: str; node_id: str; device_id: int
+    fault_domain: str; state: str; lease_id: str | None
+    last_heartbeat: float = ...
+
+
+class GlobalScheduler:
+    """故障域感知调度 (纯逻辑, 无 Ray 依赖, 可单测)。"""
+
+    def select_actors(self, actors, nodes, world_size,
+                      fault_domain_constraint=None,
+                      prefer_driver_node=None) -> list[str]: ...
+        """优先级: 硬约束 > 故障域 spread > 负载均衡 > driver 就近"""
 ```
 
 ---
@@ -704,11 +786,15 @@ multi-task-infer/                            # ⭐ 新增: 独立插件包 (G5 �
 │   ├── actor_pool_manager.py          # ⭐ ActorPoolManager
 │   ├── external_worker_actor.py       # ⭐ ExternalWorkerActor + ActorState
 │   ├── cache_manager_actor.py         # ⭐ CacheManagerActor (G6)
+│   ├── cluster_state.py               # ⭐ NodeInfo / ActorRegistration / GlobalScheduler
+│   ├── node_registry_actor.py         # ⭐ NodeRegistryActor (注册/心跳/统一视图/死检测)
 │   └── storage_checkpoint_engine.py   # ⭐ StorageCheckpointEngine + StorageBackend (G7)
 ├── examples/
 │   ├── basic_usage.py                 # 使用示例
+│   ├── verify_multi_task_sharing.py   # 多任务共享验证脚本
 │   └── mooncake_config.json           # Mooncake 配置模板
 ├── tests/
+│   ├── test_global_scheduler.py       # 测试: 故障域感知调度
 │   └── test_storage_checkpoint_engine.py   # 测试: nfs / mooncake_mock / mooncake
 ├── README.md                          # 使用文档
 ├── STORAGE_CHECKPOINT_ENGINE_DESIGN.md
@@ -929,14 +1015,18 @@ class EngineCore:
 | 文件 | 说明 | 实际行数 |
 |------|------|---------|
 | `multi-task-infer/pyproject.toml` | 包配置 + vllm.general_plugins 入口点 | ~50 |
-| `vllm_external_executor/__init__.py` | 模块入口 + register_plugin() | ~110 |
-| `vllm_external_executor/external_executor.py` | ExternalExecutor 实现（G1/G4） | ~490 |
-| `vllm_external_executor/actor_pool_manager.py` | ActorPoolManager 实现（G1/G2） | ~333 |
-| `vllm_external_executor/external_worker_actor.py` | ExternalWorkerActor 实现 | ~496 |
+| `vllm_external_executor/__init__.py` | 模块入口 + register_plugin() | ~123 |
+| `vllm_external_executor/external_executor.py` | ExternalExecutor 实现（G1/G4） | ~578 |
+| `vllm_external_executor/actor_pool_manager.py` | ActorPoolManager 实现（G1/G2 + 分布式能力） | ~712 |
+| `vllm_external_executor/external_worker_actor.py` | ExternalWorkerActor 实现 | ~652 |
+| `vllm_external_executor/cluster_state.py` | NodeInfo / ActorRegistration / GlobalScheduler（纯逻辑） | ~272 |
+| `vllm_external_executor/node_registry_actor.py` | NodeRegistryActor：注册/心跳/统一视图/死检测 | ~279 |
 | `vllm_external_executor/cache_manager_actor.py` | CacheManagerActor 实现（G6） | ~474 |
-| `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~880 |
+| `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~884 |
 | `examples/basic_usage.py` | 使用示例 | ~223 |
+| `examples/verify_multi_task_sharing.py` | 多任务共享验证脚本 | ~369 |
 | `examples/mooncake_config.json` | Mooncake 配置模板 | ~10 |
+| `tests/test_global_scheduler.py` | 测试：GlobalScheduler 故障域调度 | ~137 |
 | `tests/test_storage_checkpoint_engine.py` | 测试：nfs / mooncake_mock / mooncake | ~483 |
 | `verify_dependencies.sh` | 依赖验证脚本 | ~120 |
 
@@ -1173,9 +1263,51 @@ vLLM 核心修改（最小侵入，G5）：
 │  │                             编译缓存读写失败      跳过缓存直接编译         │   │
 │  │                                                                          │   │
 │  │  节点故障                    该节点所有 Actor 不可用  ActorPoolManager     │   │
-│  │                              需要重新分配 Actor    检测到后标记 FAILED     │   │
-│  │                                                   从其他节点 acquire      │   │
+│  │                              (心跳超时)              心跳线程检测到死节点     │   │
+│  │                                                    recover_node() 重建      │   │
+│  │                                                    (见 §4.5)               │   │
 │  └──────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 4.5 分布式控制面（节点注册 / 心跳 / 全局调度 / 故障隔离）
+
+> 三项分布式能力在 `node_registry_actor.py` + `cluster_state.py` +
+> `actor_pool_manager.py` 落地，与 §4.4 故障域对应。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                            分布式控制面                                         │
+│                                                                                  │
+│  ┌────────────────────┐        ┌─────────────────────────────────────────────┐  │
+│  │  NodeRegistryActor  │◄───── │  ActorPoolManager (每租户一个, 共享全局视图) │  │
+│  │  (Ray 单例, detached)│       │  - pre_start: 注册节点 + Actor               │  │
+│  │                    │       │  - acquire: 委托 GlobalScheduler              │  │
+│  │  _nodes:           │       │  - 心跳线程: 周期探测 Actor → registry.heartbeat│
+│  │    node_id → NodeInfo │     │  - recover_node: 节点故障重建                 │  │
+│  │  _actors:          │       └─────────────────────────────────────────────┘  │
+│  │    actor_id → ActorRegistration │                                            │
+│  └────────────────────┘                                                        │
+│           ▲                                                                    │
+│           │ heartbeat(state, timestamp) / register / set_actor_state           │
+│  ┌────────┴────────────────────────────────────────────────────────────┐       │
+│  │  三个能力 → 三类实现对标                                             │       │
+│  │  ① 跨节点注册/心跳/统一视图                                          │       │
+│  │     - NodeInfo: node_id/ip/hostname/fault_domain/total_gpus/free_gpus │      │
+│  │     - ActorRegistration: actor_id/node/device/state/lease/heartbeat  │       │
+│  │     - get_global_view(): 每节点空闲 GPU + 每故障域分布 + 心跳年龄      │       │
+│  │     - detect_dead_actors/nodes(timeout): 失联检测                     │       │
+│  │  ② 全局调度器 (GlobalScheduler, 纯逻辑可单测)                          │      │
+│  │     - select_actors(): 按故障域 spread → 负载均衡 → driver 就近        │       │
+│  │     - fault_domain_constraint: {故障域: 数量} 硬约束                  │       │
+│  │     - 跨节点迁移 = rebuild_actor(): GPU Actor 无法 live-migrate,      │       │
+│  │       故障/负载触发的等价重建                                          │       │
+│  │  ③ 节点级故障域隔离                                                   │       │
+│  │     - fault_domain 默认 = node_id (每节点独立故障域)                  │       │
+│  │     - acquire 默认 spread, 单节点故障只损失其自身 Actor               │       │
+│  │     - 心跳超时 → mark_node_failed → recover_node 在健康节点重建        │       │
+│  │     - 所有 ray.get 加 RPC_TIMEOUT, 节点失联不挂起                     │       │
+│  └──────────────────────────────────────────────────────────────────────┘       │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
