@@ -87,6 +87,9 @@ class ExternalExecutor(RayExecutorV2):
         # Engine-core scheduler gate (injected via set_scheduler_gate).
         self._migration_pause_fn = None
         self._migration_resume_fn = None
+        # EngineCore scheduler reference, bound via bind_scheduler (the
+        # EngineCore hook): source of truth for KV-block metadata.
+        self._scheduler = None
         
         if external_actors is not None:
             world_size = vllm_config.parallel_config.world_size
@@ -678,6 +681,88 @@ class ExternalExecutor(RayExecutorV2):
         self._migration_pause_fn = pause_fn
         self._migration_resume_fn = resume_fn
 
+    def bind_scheduler(self, scheduler) -> None:
+        """Receive the EngineCore scheduler reference (core.py hook).
+
+        The scheduler owns ``kv_cache_manager.block_pool``, the source of truth
+        for KV-block metadata (block ids, prefix-cache hashes, ref counts).
+        This enables :meth:`snapshot_kv_blocks` and
+        :meth:`import_prefix_cache` without reaching into private structures
+        from outside the engine loop.
+        """
+        self._scheduler = scheduler
+
+    def snapshot_kv_blocks(self) -> list:
+        """Export live KV blocks as ``KVBlockRef`` metadata.
+
+        Walks the scheduler's block pool and returns one ref per block that is
+        either referenced by a request (``ref_cnt > 0``) or resident in the
+        prefix cache (``block_hash`` set). The content hash is the block's
+        ``BlockHashWithGroupId`` hex, stable across processes thanks to
+        vLLM's deterministic prefix hashing.
+
+        Returns:
+            ``KVBlockRef`` list suitable for :class:`IncrementalKVPlanner`.
+        """
+        from vllm_external_executor.kv_migration import KVBlockRef
+
+        if self._scheduler is None:
+            raise RuntimeError(
+                "scheduler not bound; this executor requires the EngineCore "
+                "bind_scheduler hook"
+            )
+        block_pool = self._scheduler.kv_cache_manager.block_pool
+        refs = []
+        for block in block_pool.blocks:
+            if block.ref_cnt <= 0 and block.block_hash is None:
+                continue
+            refs.append(
+                KVBlockRef(
+                    block_id=block.block_id,
+                    content_hash=(
+                        block.block_hash.hex()
+                        if block.block_hash is not None
+                        else ""
+                    ),
+                    version=block.ref_cnt,
+                )
+            )
+        return refs
+
+    def import_prefix_cache(
+        self,
+        block_id_to_hash: dict[int, str | bytes],
+    ) -> int:
+        """Restore the prefix-cache index after an incremental KV import.
+
+        After the data plane copies KV tensors into the destination workers,
+        the scheduler-side prefix cache is still stale. This re-registers the
+        imported blocks' hashes so subsequent requests hit them. Accepts hex
+        strings (as produced by :meth:`snapshot_kv_blocks`) or raw bytes
+        (``BlockHashWithGroupId``).
+
+        Args:
+            block_id_to_hash: Destination block id -> content hash.
+
+        Returns:
+            Number of hashes registered.
+        """
+        if self._scheduler is None:
+            raise RuntimeError(
+                "scheduler not bound; this executor requires the EngineCore "
+                "bind_scheduler hook"
+            )
+        converted = {
+            block_id: (
+                hash_value
+                if isinstance(hash_value, bytes)
+                else bytes.fromhex(hash_value)
+            )
+            for block_id, hash_value in block_id_to_hash.items()
+        }
+        self._scheduler.kv_cache_manager.block_pool.import_block_hashes(converted)
+        return len(converted)
+
     def migrate_kv_cache_incremental(
         self,
         src_executor: "ExternalExecutor",
@@ -739,6 +824,44 @@ class ExternalExecutor(RayExecutorV2):
                 "Transferred %d KV blocks (rank-for-rank)",
                 len(block_ids),
             )
+
+        return plan
+
+    def migrate_kv_cache_to(
+        self,
+        target_executor: "ExternalExecutor",
+    ):
+        """
+        End-to-end incremental KV migration from this executor to another.
+
+        Assumes a same-model, same-layout migration (e.g. cross-node actor
+        migration): physical block ids correspond 1:1 across executors. Flows
+        through snapshot -> diff -> data-plane copy -> prefix-cache restore.
+
+        Args:
+            target_executor: Destination executor (empty or partially-populated
+                KV cache).
+
+        Returns:
+            The computed :class:`KVMigrationPlan`.
+        """
+        src_blocks = self.snapshot_kv_blocks()
+        dst_blocks = target_executor.snapshot_kv_blocks()
+        plan = target_executor.migrate_kv_cache_incremental(
+            self, src_blocks, dst_blocks
+        )
+
+        if plan.transfer:
+            block_id_to_hash = {
+                b.block_id: b.content_hash
+                for b in plan.transfer
+                if b.content_hash
+            }
+            if block_id_to_hash:
+                imported = target_executor.import_prefix_cache(block_id_to_hash)
+                logger.info(
+                    "Restored prefix-cache index for %d blocks", imported
+                )
 
         return plan
 

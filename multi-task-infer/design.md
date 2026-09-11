@@ -473,8 +473,18 @@ class IncrementalKVPlanner:
 > `import_kv_blocks(payloads)` 按 rank 搬运 KV 块 tensor；编排入口
 > `ExternalExecutor.migrate_kv_cache_incremental(src_executor, src_blocks,
 > dst_blocks)` 只传输 `plan.transfer`，prefix_hit/unchanged 不动。
-> 增量 diff 的元数据（活跃块表/dirty bitmap/content hash）来自 vLLM
-> EngineCore 的 KV cache manager，属深度协同，见 §5.3.2。
+>
+> 控制面（插件侧钩子，由 EngineCore `bind_scheduler` 触发）：
+> ```python
+> class ExternalExecutor:
+>     def bind_scheduler(self, scheduler) -> None: ...   # 拿 block_pool 源真相
+>     def snapshot_kv_blocks(self) -> list[KVBlockRef]:  # 遍历 block_pool.blocks
+>     def import_prefix_cache(self, block_id_to_hash) -> int:  # 重建 prefix 索引
+>     def migrate_kv_cache_to(self, target_executor):    # 端到端增量迁移编排
+> ```
+> 核心改动 2 处：`vllm/v1/engine/core.py`（scheduler 构造后调用
+> `executor.bind_scheduler`，no-op 默认值）；`vllm/v1/core/block_pool.py`
+> （公开 `BlockPool.import_block_hashes` 幂等重建 prefix 索引）。详见 §5.3.2。
 
 ---
 
@@ -1075,13 +1085,38 @@ class EngineCore:
             self.model_executor = executor_class(vllm_config)
 ```
 
+### 3.3.7 EngineCore bind_scheduler hook（KV 增量迁移）
+
+```python
+# vllm/v1/engine/core.py
+class EngineCore:
+    def __init__(self, ...):
+        self.scheduler: SchedulerInterface = Scheduler(...)
+        # ⭐ 让插件 executor 观察 scheduler（KV 块快照 / prefix 重映射）
+        bind_scheduler = getattr(self.model_executor, "bind_scheduler", None)
+        if bind_scheduler is not None:
+            bind_scheduler(self.scheduler)
+        self.use_spec_decode = ...
+```
+
+### 3.3.8 BlockPool.import_block_hashes（prefix-cache 重映射）
+
+```python
+# vllm/v1/core/block_pool.py
+class BlockPool:
+    def import_block_hashes(self, block_id_to_hash: dict) -> None:
+        """迁移数据面写完 KV tensor 后，重建 prefix-cache 索引（幂等）。"""
+        for block_id, block_hash in block_id_to_hash.items():
+            self._insert_block_hash(block_hash, self.blocks[block_id], num_tokens=None)
+```
+
 ## 3.4 新增文件清单
 
 | 文件 | 说明 | 实际行数 |
 |------|------|---------|
 | `multi-task-infer/pyproject.toml` | 包配置 + vllm.general_plugins 入口点 | ~50 |
 | `vllm_external_executor/__init__.py` | 模块入口 + register_plugin() | ~123 |
-| `vllm_external_executor/external_executor.py` | ExternalExecutor 实现（G1/G4 + 迁移状态机 + 增量 KV） | ~788 |
+| `vllm_external_executor/external_executor.py` | ExternalExecutor 实现（G1/G4 + 迁移状态机 + 增量 KV） | ~911 |
 | `vllm_external_executor/actor_pool_manager.py` | ActorPoolManager 实现（G1/G2 + 分布式 + 迁移） | ~849 |
 | `vllm_external_executor/external_worker_actor.py` | ExternalWorkerActor 实现 | ~763 |
 | `vllm_external_executor/cluster_state.py` | NodeInfo / ActorRegistration / GlobalScheduler（纯逻辑） | ~272 |
@@ -1526,9 +1561,9 @@ vLLM 核心修改（最小侵入，G5）：
 
 ## 5.3.2 场景 3c：KV 块增量迁移（含 Prefix Caching）
 
-> 现状：`switch_model` 的 `_reinitialize_kv_cache()` 全量重分配 KV cache，
-> 大模型/长上下文开销极高。增量迁移只搬运「新增/修改」的 KV 块，公共前缀
-> （prefix cache 命中）零传输。
+> ✅ **已打通（2 处最小核心改动 + 插件逻辑）**。`switch_model` 的
+> `_reinitialize_kv_cache()` 原全量重分配 KV cache，大模型/长上下文开销极高。
+> 增量迁移只搬运「新增/修改」的 KV 块，公共前缀（prefix cache 命中）零传输。
 
 ```
   参与者: EngineCore(KV cache manager), ExternalExecutor, Worker(源/目标)
@@ -1540,15 +1575,19 @@ vLLM 核心修改（最小侵入，G5）：
        - transfer:    新增/修改且无 hash 命中 → 需搬运数据
   ③ ExternalExecutor.migrate_kv_cache_incremental():
        仅对 plan.transfer 按 rank export_kv_blocks → import_kv_blocks
-  ④ EngineCore 重映射目标 block table（prefix_hits 指向复用块）
+  ④ import_prefix_cache(): 重建目标 block_pool 的 prefix-cache 索引
   ⑤ 恢复调度 (resume)
 
   效果: 长上下文续写/多轮对话只迁「增量 KV 块」，公共前缀复用已缓存块，
         迁移成本从 O(num_blocks) 降到 O(新增+修改块)。
 
-  边界(深度协同): 活跃块表 / dirty bitmap / content_hash 在 vLLM EngineCore
-  的 KV cache manager 中，executor 只做数据面搬运；实现需在 EngineCore 侧
-  暴露块表快照 + block-table 重映射钩子，属剩余核心改动。
+  核心改动(2 处, 极小):
+  1. vllm/v1/engine/core.py: scheduler 构造后若 executor 有 bind_scheduler
+     钩子则调用 — 让插件拿到 scheduler(块表源真相), 默认 executor no-op。
+  2. vllm/v1/core/block_pool.py: 公开 BlockPool.import_block_hashes()
+     — 数据面写完 KV tensor 后重建 prefix-cache 索引(幂等)。
+  其余全在插件 vllm_external_executor/: bind_scheduler / snapshot_kv_blocks /
+  import_prefix_cache / migrate_kv_cache_to (端到端编排)。
 ```
 
 ## 5.4 场景 4：弹性伸缩（TP/PP 变化）

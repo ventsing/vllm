@@ -175,6 +175,12 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        # Let executor plugins observe the scheduler (KV-block snapshot /
+        # prefix-cache remap for incremental migration). Default executors do
+        # not implement this hook, so this is a no-op for them.
+        bind_scheduler = getattr(self.model_executor, "bind_scheduler", None)
+        if bind_scheduler is not None:
+            bind_scheduler(self.scheduler)
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
