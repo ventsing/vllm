@@ -586,6 +586,76 @@ class ExternalWorkerActor:
             storage_config=snapshot["storage_config"],
         )
     
+    # ======================================================== KV-block transfer
+    def export_kv_blocks(self, block_ids: list[int]) -> list[dict]:
+        """Slice the given KV blocks out of this worker's KV caches.
+
+        Data-plane half of incremental KV migration. The *choice* of which
+        blocks to ship (the diff) is computed by
+        :class:`IncrementalKVPlanner` in EngineCore from the KV cache manager's
+        block table; this method only moves block tensors.
+
+        KV cache tensor layout is backend-dependent but block index is the
+        leading dimension, so a block is ``kv_caches[g][block_id]``. Each group
+        contributes a shard referenced by its group index.
+
+        Args:
+            block_ids: Physical block ids to export.
+
+        Returns:
+            List of ``{block_id, shards: {group_id: tensor}}`` payloads,
+            serializable over the chosen transport (Ray object store).
+        """
+        caches = self._get_kv_caches()
+        payloads = []
+        for block_id in block_ids:
+            shards = {}
+            for gidx, cache in enumerate(caches):
+                shards[gidx] = cache[block_id]
+            payloads.append({"block_id": block_id, "shards": shards})
+        return payloads
+    
+    def import_kv_blocks(self, payloads: list[dict]) -> int:
+        """Write exported KV blocks back into this worker's KV caches.
+
+        Args:
+            payloads: Payloads produced by :meth:`export_kv_blocks`.
+
+        Returns:
+            Number of blocks written.
+        """
+        caches = self._get_kv_caches()
+        count = 0
+        for payload in payloads:
+            block_id = payload["block_id"]
+            for gidx, tensor in payload["shards"].items():
+                caches[gidx][block_id].copy_(tensor)
+            count += 1
+        return count
+    
+    def _get_kv_caches(self):
+        """Return this worker's KV cache tensors (one per cache group).
+
+        Resolves the model runner through the worker wrapper's attribute
+        forwarding; KV cache tensors live at ``model_runner.kv_caches``.
+        """
+        runner = getattr(self.worker, "model_runner", None)
+        if runner is None:
+            runner = self.worker.worker.model_runner
+        caches = getattr(runner, "kv_caches", None)
+        if not caches:
+            raise RuntimeError("KV caches are not initialized on this worker")
+        return caches
+    
+    def get_kv_cache_metadata(self) -> dict:
+        """Return structural KV cache metadata (for capacity planning)."""
+        caches = self._get_kv_caches()
+        return {
+            "num_groups": len(caches),
+            "num_blocks": int(caches[0].shape[0]) if caches else 0,
+            "block_size": int(caches[0].shape[1]) if caches else 0,
+        }
+    
     def initialize_kv_cache(self, kv_cache_config) -> None:
         """
         Initialize KV Cache.
