@@ -444,6 +444,38 @@ class MigrationIdempotencyRegistry:
     def get(self, migration_id) -> MigrationStateMachine | None: ...
 ```
 
+### 1.3.7 KV 块增量迁移 / Prefix Caching
+
+```python
+@dataclass
+class KVBlockRef:
+    """KV 块元数据（活跃块/dirty/hash，元数据源是 EngineCore 的 KV cache manager）。"""
+    block_id: int
+    content_hash: str = ""    # prefix cache key, 空串 = 无可哈希内容
+    version: int = 0          # 写入版本(无 hash 时的修改检测)
+    token_count: int = 16
+
+@dataclass
+class KVMigrationPlan:
+    transfer: list[KVBlockRef]              # 需传输数据(新增/修改)
+    prefix_hits: list[tuple[int, int]]      # (src_id, dst_id) 复用, 零传输
+    unchanged: list[int]                    # 已存在, 跳过
+
+class IncrementalKVPlanner:
+    """纯逻辑增量 diff: 内容 hash 优先, version 兜底。"""
+    def plan(self, src, dst) -> KVMigrationPlan: ...
+        # 同 id 同内容 -> unchanged; 同 id 异内容 -> transfer
+        # 新 id 但 hash 命中 dst(任意 id) -> prefix_hit(复用公共前缀, 零传输)
+        # 其它 -> transfer
+```
+
+> 数据面：`ExternalWorkerActor.export_kv_blocks(block_ids)` /
+> `import_kv_blocks(payloads)` 按 rank 搬运 KV 块 tensor；编排入口
+> `ExternalExecutor.migrate_kv_cache_incremental(src_executor, src_blocks,
+> dst_blocks)` 只传输 `plan.transfer`，prefix_hit/unchanged 不动。
+> 增量 diff 的元数据（活跃块表/dirty bitmap/content hash）来自 vLLM
+> EngineCore 的 KV cache manager，属深度协同，见 §5.3.2。
+
 ---
 
 # 2. 进程视图（Process View）
@@ -818,6 +850,7 @@ multi-task-infer/                            # ⭐ 新增: 独立插件包 (G5 �
 │   ├── cluster_state.py               # ⭐ NodeInfo / ActorRegistration / GlobalScheduler
 │   ├── node_registry_actor.py         # ⭐ NodeRegistryActor (注册/心跳/统一视图/死检测)
 │   ├── migration.py                   # ⭐ 迁移状态机 + 事务 + 幂等 + FlightBatchPolicy
+│   ├── kv_migration.py                # ⭐ KV 块增量迁移规划 + Prefix Caching 感知
 │   └── storage_checkpoint_engine.py   # ⭐ StorageCheckpointEngine + StorageBackend (G7)
 ├── examples/
 │   ├── basic_usage.py                 # 使用示例
@@ -826,6 +859,7 @@ multi-task-infer/                            # ⭐ 新增: 独立插件包 (G5 �
 ├── tests/
 │   ├── test_global_scheduler.py       # 测试: 故障域感知调度
 │   ├── test_migration.py              # 测试: 迁移状态机 + 事务 + 幂等
+│   ├── test_kv_migration.py           # 测试: KV 增量 diff + prefix cache
 │   └── test_storage_checkpoint_engine.py   # 测试: nfs / mooncake_mock / mooncake
 ├── README.md                          # 使用文档
 ├── STORAGE_CHECKPOINT_ENGINE_DESIGN.md
@@ -1047,12 +1081,13 @@ class EngineCore:
 |------|------|---------|
 | `multi-task-infer/pyproject.toml` | 包配置 + vllm.general_plugins 入口点 | ~50 |
 | `vllm_external_executor/__init__.py` | 模块入口 + register_plugin() | ~123 |
-| `vllm_external_executor/external_executor.py` | ExternalExecutor 实现（G1/G4 + 迁移状态机） | ~718 |
+| `vllm_external_executor/external_executor.py` | ExternalExecutor 实现（G1/G4 + 迁移状态机 + 增量 KV） | ~788 |
 | `vllm_external_executor/actor_pool_manager.py` | ActorPoolManager 实现（G1/G2 + 分布式 + 迁移） | ~849 |
-| `vllm_external_executor/external_worker_actor.py` | ExternalWorkerActor 实现 | ~693 |
+| `vllm_external_executor/external_worker_actor.py` | ExternalWorkerActor 实现 | ~763 |
 | `vllm_external_executor/cluster_state.py` | NodeInfo / ActorRegistration / GlobalScheduler（纯逻辑） | ~272 |
 | `vllm_external_executor/node_registry_actor.py` | NodeRegistryActor：注册/心跳/统一视图/死检测 | ~279 |
 | `vllm_external_executor/migration.py` | 迁移状态机 + 原子事务 + 幂等 + FlightBatchPolicy | ~313 |
+| `vllm_external_executor/kv_migration.py` | KV 块增量迁移规划 + Prefix Caching 感知 | ~138 |
 | `vllm_external_executor/cache_manager_actor.py` | CacheManagerActor 实现（G6） | ~474 |
 | `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~884 |
 | `examples/basic_usage.py` | 使用示例 | ~223 |
@@ -1060,6 +1095,7 @@ class EngineCore:
 | `examples/mooncake_config.json` | Mooncake 配置模板 | ~10 |
 | `tests/test_global_scheduler.py` | 测试：GlobalScheduler 故障域调度 | ~137 |
 | `tests/test_migration.py` | 测试：迁移状态机 + 事务 + 幂等 | ~151 |
+| `tests/test_kv_migration.py` | 测试：KV 块增量 diff + prefix cache | ~110 |
 | `tests/test_storage_checkpoint_engine.py` | 测试：nfs / mooncake_mock / mooncake | ~483 |
 | `verify_dependencies.sh` | 依赖验证脚本 | ~120 |
 
@@ -1486,6 +1522,33 @@ vLLM 核心修改（最小侵入，G5）：
   ⑤ LOAD         注册新 actor + 原子更新本地映射（build-before-swap）
   ⑥ RESTORE      仅此刻 kill 旧 actor + 注销旧注册（swap 已提交）
   ⑦ COMPLETED    幂等（migration_id 去重）；中途失败 → 旧 actor 仍在 → 无损回滚
+```
+
+## 5.3.2 场景 3c：KV 块增量迁移（含 Prefix Caching）
+
+> 现状：`switch_model` 的 `_reinitialize_kv_cache()` 全量重分配 KV cache，
+> 大模型/长上下文开销极高。增量迁移只搬运「新增/修改」的 KV 块，公共前缀
+> （prefix cache 命中）零传输。
+
+```
+  参与者: EngineCore(KV cache manager), ExternalExecutor, Worker(源/目标)
+
+  ① EngineCore 暂停调度 (set_scheduler_gate)，收集源端活跃块表 + content_hash
+  ② IncrementalKVPlanner.plan(src_blocks, dst_blocks) 计算增量 diff:
+       - unchanged:   同 block_id 且内容一致(hash 优先, version 兜底) → 跳过
+       - prefix_hits: 新 id 但 hash 命中目标任意 id → 复用公共前缀, 零传输
+       - transfer:    新增/修改且无 hash 命中 → 需搬运数据
+  ③ ExternalExecutor.migrate_kv_cache_incremental():
+       仅对 plan.transfer 按 rank export_kv_blocks → import_kv_blocks
+  ④ EngineCore 重映射目标 block table（prefix_hits 指向复用块）
+  ⑤ 恢复调度 (resume)
+
+  效果: 长上下文续写/多轮对话只迁「增量 KV 块」，公共前缀复用已缓存块，
+        迁移成本从 O(num_blocks) 降到 O(新增+修改块)。
+
+  边界(深度协同): 活跃块表 / dirty bitmap / content_hash 在 vLLM EngineCore
+  的 KV cache manager 中，executor 只做数据面搬运；实现需在 EngineCore 侧
+  暴露块表快照 + block-table 重映射钩子，属剩余核心改动。
 ```
 
 ## 5.4 场景 4：弹性伸缩（TP/PP 变化）

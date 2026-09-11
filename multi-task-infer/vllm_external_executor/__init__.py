@@ -60,6 +60,11 @@ from vllm_external_executor.migration import (
     MigrationSpec,
     MigrationStateMachine,
 )
+from vllm_external_executor.kv_migration import (
+    IncrementalKVPlanner,
+    KVBlockRef,
+    KVMigrationPlan,
+)
 from vllm_external_executor.storage_checkpoint_engine import (
     StorageCheckpointEngine,
     StorageBackend,
@@ -91,6 +96,9 @@ __all__ = [
     "MigrationPhase",
     "MigrationSpec",
     "MigrationStateMachine",
+    "IncrementalKVPlanner",
+    "KVBlockRef",
+    "KVMigrationPlan",
     "StorageCheckpointEngine",
     "StorageBackend",
     "StorageBackendFactory",

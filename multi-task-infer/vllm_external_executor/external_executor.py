@@ -678,6 +678,70 @@ class ExternalExecutor(RayExecutorV2):
         self._migration_pause_fn = pause_fn
         self._migration_resume_fn = resume_fn
 
+    def migrate_kv_cache_incremental(
+        self,
+        src_executor: "ExternalExecutor",
+        src_blocks: list,
+        dst_blocks: list,
+    ):
+        """
+        Ship only the KV blocks that actually changed to this executor.
+
+        Data-plane half of incremental KV migration. The diff (which blocks are
+        new/modified/prefix-reused) is computed by :class:`IncrementalKVPlanner`
+        from EngineCore's KV cache manager block tables; this method moves the
+        ``transfer`` block tensors rank-for-rank from ``src_executor`` workers
+        to this executor's workers, leaving prefix-cache hits and unchanged
+        blocks untouched.
+
+        Args:
+            src_executor: Source executor whose workers hold the live KV cache.
+            src_blocks: Source ``KVBlockRef`` metadata (live blocks).
+            dst_blocks: Destination ``KVBlockRef`` metadata (resident blocks).
+
+        Returns:
+            The computed :class:`KVMigrationPlan` (transfer / prefix_hits /
+            unchanged), so EngineCore can remap the destination block table.
+        """
+        import ray
+
+        from vllm_external_executor.kv_migration import IncrementalKVPlanner
+
+        if len(src_executor.ray_worker_handles) != len(self.ray_worker_handles):
+            raise ValueError(
+                "src/dst executor world_size mismatch: "
+                f"{len(src_executor.ray_worker_handles)} vs "
+                f"{len(self.ray_worker_handles)}"
+            )
+
+        plan = IncrementalKVPlanner().plan(src_blocks, dst_blocks)
+        logger.info("Incremental KV migration: %s", plan.summary())
+
+        if plan.transfer:
+            block_ids = [b.block_id for b in plan.transfer]
+            exported = ray.get(
+                [
+                    h.actor.export_kv_blocks.remote(block_ids)
+                    for h in src_executor.ray_worker_handles
+                ],
+                timeout=_MIGRATION_RPC_TIMEOUT,
+            )
+            ray.get(
+                [
+                    dh.actor.import_kv_blocks.remote(payloads)
+                    for dh, payloads in zip(
+                        self.ray_worker_handles, exported
+                    )
+                ],
+                timeout=_MIGRATION_RPC_TIMEOUT,
+            )
+            logger.info(
+                "Transferred %d KV blocks (rank-for-rank)",
+                len(block_ids),
+            )
+
+        return plan
+
     def _reinitialize_kv_cache(self) -> None:
         """
         Re-profile available GPU memory and re-allocate KV cache.
