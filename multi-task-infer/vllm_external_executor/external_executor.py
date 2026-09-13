@@ -69,6 +69,11 @@ class ExternalExecutor(RayExecutorV2):
         vllm_config: VllmConfig,
         external_actors: list | None = None,
         cache_manager: Any | None = None,
+        prefix_index: Any | None = None,
+        weight_ledger: Any | None = None,
+        heat_tracker: Any | None = None,
+        tiered_cache: Any | None = None,
+        prefetch_policy: Any | None = None,
     ):
         """
         Initialize the ExternalExecutor.
@@ -78,6 +83,16 @@ class ExternalExecutor(RayExecutorV2):
             external_actors: Pre-started Ray Actor handles. If None, falls back
                            to standard RayExecutorV2 behavior.
             cache_manager: CacheManagerActor handle for cache sharing.
+            prefix_index: Shared :class:`GlobalPrefixIndex` (cluster-wide prefix
+                reuse). Defaults to a per-executor instance.
+            weight_ledger: Shared :class:`WeightShareLedger` (base+adapter
+                residency). Defaults to a per-executor instance.
+            heat_tracker: Shared :class:`AccessHeatTracker` for prefetch
+                ranking. Defaults to a per-executor instance.
+            tiered_cache: Shared :class:`TieredCache` for checkpoint-tier
+                bookkeeping. Defaults to an unbounded per-executor instance.
+            prefetch_policy: :class:`PrefetchPolicy` for async prefetch
+                decisions. Defaults to a per-executor instance.
         """
         self.external_actors = external_actors
         self._cache_manager = cache_manager
@@ -90,7 +105,16 @@ class ExternalExecutor(RayExecutorV2):
         # EngineCore scheduler reference, bound via bind_scheduler (the
         # EngineCore hook): source of truth for KV-block metadata.
         self._scheduler = None
-        
+
+        # Decision-layer wiring (storage tiering / prefetch / prefix reuse).
+        self._init_decision_layer(
+            prefix_index=prefix_index,
+            weight_ledger=weight_ledger,
+            heat_tracker=heat_tracker,
+            tiered_cache=tiered_cache,
+            prefetch_policy=prefetch_policy,
+        )
+
         if external_actors is not None:
             world_size = vllm_config.parallel_config.world_size
             if len(external_actors) != world_size:
@@ -100,6 +124,85 @@ class ExternalExecutor(RayExecutorV2):
                 )
         
         super().__init__(vllm_config)
+
+    def _init_decision_layer(
+        self,
+        prefix_index=None,
+        weight_ledger=None,
+        heat_tracker=None,
+        tiered_cache=None,
+        prefetch_policy=None,
+    ) -> None:
+        """Create (or adopt) the decision-layer objects and the orchestrator."""
+        from vllm_external_executor.global_prefix_index import GlobalPrefixIndex
+        from vllm_external_executor.migration_orchestrator import (
+            MigrationOrchestrator,
+        )
+        from vllm_external_executor.prefetch_policy import (
+            AccessHeatTracker,
+            PrefetchPolicy,
+        )
+        from vllm_external_executor.storage_tier import StorageTier, TieredCache
+        from vllm_external_executor.weight_sharing import WeightShareLedger
+
+        self._prefix_index = prefix_index or GlobalPrefixIndex()
+        self._weight_ledger = weight_ledger or WeightShareLedger()
+        self._heat = heat_tracker or AccessHeatTracker()
+        self._tiered_cache = tiered_cache or TieredCache(
+            {
+                StorageTier.HBM: float("inf"),
+                StorageTier.DRAM: float("inf"),
+                StorageTier.REMOTE: float("inf"),
+            }
+        )
+        self._prefetch_policy = prefetch_policy or PrefetchPolicy(
+            budget_bytes=256 * 1024 * 1024
+        )
+        self._orchestrator = MigrationOrchestrator(
+            tiered_cache=self._tiered_cache,
+            heat=self._heat,
+            prefetch_policy=self._prefetch_policy,
+            prefix_index=self._prefix_index,
+            weight_ledger=self._weight_ledger,
+            start_prefetch=self._start_prefetch,
+            await_prefetch=self._await_prefetch,
+        )
+
+    # ----------------------------------------------------- prefetch execution
+    def _start_prefetch(self, keys) -> None:
+        """Begin background prefetch of ``keys`` (override for async I/O).
+
+        Default is a no-op log: the decision layer names *what* to prefetch;
+        a production executor launches a thread/ray task to load those keys
+        while the current model keeps serving, then signals completion for
+        :meth:`_await_prefetch`.
+        """
+        if keys:
+            logger.info("Prefetch nominated (%d keys, not started)", len(keys))
+
+    def _await_prefetch(self) -> None:
+        """Block until in-flight prefetch completes (override for async I/O).
+
+        Called by the orchestrator at LOAD, after CHECKPOINT/UNLOAD, so the
+        prefetched state overlaps unrelated migration work.
+        """
+        return
+
+    # ------------------------------------------------------- migration helpers
+    def _weight_hash(self) -> str:
+        """Stable weight-configuration hash for prefix/weight reuse groups."""
+        model = getattr(self.vllm_config.model_config, "model", "unknown")
+        tp = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
+        pp = getattr(
+            self.vllm_config.parallel_config, "pipeline_parallel_size", 1
+        )
+        return f"{model}@tp{tp}pp{pp}"
+
+    def _actor_id(self) -> str:
+        """A stable identity for this executor's actor group (first node)."""
+        if self.ray_worker_handles:
+            return getattr(self.ray_worker_handles[0], "node_id", None) or "exec-0"
+        return "exec-0"
     
     def _init_executor(self) -> None:
         """
@@ -962,6 +1065,7 @@ class ExternalExecutor(RayExecutorV2):
         total_blocks: int | None = None,
         dst_occupied: list[int] | None = None,
         transport: str | None = None,
+        prefetch: bool = True,
     ):
         """
         End-to-end incremental KV migration from this executor to another.
@@ -971,6 +1075,12 @@ class ExternalExecutor(RayExecutorV2):
         provided, source block ids are remapped onto free destination ids
         (heterogeneous pools); otherwise ids map 1:1 (same-layout).
 
+        When ``prefetch`` is set, the migration is also driven through the
+        decision layer (:class:`MigrationOrchestrator`): hot, non-resident
+        prefixes are nominated at PREPARING (firing ``_start_prefetch``) and
+        the transferred prefixes are registered on the shared
+        :class:`GlobalPrefixIndex` so later engines can reuse them.
+
         Args:
             target_executor: Destination executor (empty or partially-populated
                 KV cache).
@@ -979,6 +1089,7 @@ class ExternalExecutor(RayExecutorV2):
             dst_occupied: Destination block ids already in use (when remapping).
             transport: KV transport backend name passed through to the data
                 plane (``ray_object_store`` or ``mooncake_rdma``).
+            prefetch: Drive the prefetch hook + prefix-index registration.
 
         Returns:
             The computed :class:`KVMigrationPlan`.
@@ -994,6 +1105,11 @@ class ExternalExecutor(RayExecutorV2):
                 plan,
                 total_blocks=total_blocks,
                 dst_occupied=dst_occupied or (),
+            )
+
+        if prefetch:
+            self._drive_migration_orchestrator(
+                plan, target_executor, src_blocks, dst_blocks
             )
 
         target_executor.migrate_kv_cache_incremental(
@@ -1024,6 +1140,80 @@ class ExternalExecutor(RayExecutorV2):
                 )
 
         return plan
+
+    def _drive_migration_orchestrator(
+        self,
+        plan,
+        target_executor: "ExternalExecutor",
+        src_blocks: list,
+        dst_blocks: list,
+    ):
+        """Drive the decision layer for a KV migration (prefetch + index).
+
+        Nominates hot, non-resident prefixes for async prefetch via the
+        orchestrator's PREPARING hook and registers the transferred prefixes
+        on the shared :class:`GlobalPrefixIndex` under the destination actor.
+        The tiering bookkeeping uses a synthetic ``kv:{weight_hash}`` object
+        and is advisory only: actual KV tensors move via the transport, not
+        through :class:`TieredCache`.
+        """
+        import time
+
+        from vllm_external_executor.global_prefix_index import PrefixEntry
+        from vllm_external_executor.migration import MigrationSpec
+
+        now = time.monotonic()
+        weight_hash = self._weight_hash()
+        candidates: dict[str, int] = {}
+        resident: set[str] = set()
+
+        for block in src_blocks:
+            if block.content_hash:
+                key = f"{block.content_hash}:{block.group_id}"
+                candidates[key] = candidates.get(key, 0) + 1
+                self._heat.record(key, now)
+        for block in dst_blocks:
+            if block.content_hash:
+                resident.add(f"{block.content_hash}:{block.group_id}")
+
+        prefix_entries = []
+        for block in plan.transfer:
+            if not block.content_hash:
+                continue
+            dst_id = plan.block_mapping.get(block.block_id, block.block_id)
+            prefix_entries.append(
+                PrefixEntry(
+                    content_hash=block.content_hash,
+                    group_id=block.group_id,
+                    weight_hash=weight_hash,
+                    actor_id=target_executor._actor_id(),
+                    node_id=target_executor._actor_id(),
+                    block_id=dst_id,
+                    refs=1,
+                )
+            )
+
+        spec = MigrationSpec(
+            target=f"kv-migrate:{weight_hash}",
+            payload={
+                "target_checkpoint": f"kv:{weight_hash}",
+                "checkpoint_bytes": len(plan.transfer),
+                "prefix_entries": prefix_entries,
+            },
+        )
+        _sm, script = self._orchestrator.migrate(
+            spec,
+            actor_id=target_executor._actor_id(),
+            candidates=candidates,
+            resident=resident,
+        )
+        logger.info(
+            "KV migration decision script: prefetch=%d keys (%d units), "
+            "prefix=%d entries registered",
+            len(script.prefetch_keys), script.prefetch_bytes,
+            len(script.prefix_register),
+        )
+        return script
 
     def _reinitialize_kv_cache(self) -> None:
         """

@@ -1983,11 +1983,11 @@ vLLM 核心修改（最小侵入，G5）：
 
 | 能力 | 现状 | 落地模块 | 边界 |
 |------|------|---------|------|
-| 三级分层存储（HBM/DRAM/REMOTE 自动换入换出） | 决策层已实现，**已接线到迁移状态机**（`migration_orchestrator.py`） | `storage_tier.py`（容量/LRU/升降级）+ `migration_orchestrator.py`（CHECKPOINT→REMOTE、UNLOAD→DRAM、LOAD→HBM 脚本） | `TieredCache` 只发 `EvictionDecision`，不搬张量；`ship()` 物理搬运与 `StorageBackend` 绑定的执行侧留真机 |
+| 三级分层存储（HBM/DRAM/REMOTE 自动换入换出） | 决策层已实现，**已接线到迁移状态机**（`migration_orchestrator.py`，`ExternalExecutor.migrate_kv_cache_to` 消费其脚本） | `storage_tier.py`（容量/LRU/升降级）+ `migration_orchestrator.py`（CHECKPOINT→REMOTE、UNLOAD→DRAM、LOAD→HBM 脚本） | `TieredCache` 只发 `EvictionDecision`，不搬张量；`ship()` 物理搬运与 `StorageBackend` 绑定的执行侧留真机 |
 | 同节点零拷贝传输 | 骨架已实现 | `kv_transport.py::CudaIpcTransport` + worker `export/import_kv_blocks_ipc`（`share_ipc`/`from_ipc_handle`） | 仅同节点；`torch.from_ipc_handle` API 兼容性需真机验证 |
 | 全局 KV 前缀共享 | 索引已实现 | `global_prefix_index.py`（`GlobalPrefixIndex`，按 `weight_hash` 分 key） | **KV 张量是权重相关的**：仅同 `weight_hash`（同 base+adapter）的 Actor 可复用前缀；「跨模型」严格限于权重一致 |
 | 模型权重共享（LoRA 多任务） | 记账已实现 | `weight_sharing.py`（`WeightShareLedger` + `cost_ratio` 量化 adapter/基地成本比） | worker `switch_adapter` 执行路径未落地（需 vLLM LoRA runtime 对接，真机） |
-| 异步 I/O 与预取 | 决策已实现，**hook 已接线**（PREPARING 启动 / LOAD 前 await，`migration.py::on_enter` + `migration_orchestrator.py`） | `prefetch_policy.py`（热度/预算）+ `migration.py` 阶段钩子 + `migration_orchestrator.py::_hook_prepare/_hook_await_load` | `start_prefetch`/`await_prefetch` 默认 no-op，执行侧注入后台线程后即真正异步；线程/流水线执行留真机 |
+| 异步 I/O 与预取 | 决策已实现，**hook 已接线**（PREPARING 启动 / LOAD 前 await；`ExternalExecutor._start_prefetch/_await_prefetch` 为注入点） | `prefetch_policy.py`（热度/预算）+ `migration.py` 阶段钩子 + `migration_orchestrator.py` + `external_executor.py::_drive_migration_orchestrator` | `_start_prefetch`/`_await_prefetch` 默认 no-op+日志，执行侧覆盖为后台线程/ray task 后即真正异步；线程/流水线执行留真机 |
 
 ---
 
