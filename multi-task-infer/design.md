@@ -488,7 +488,22 @@ class BlockIdAllocator:
 > 数据面：`ExternalWorkerActor.export_kv_blocks(block_ids)` /
 > `import_kv_blocks(payloads)` 按 rank 搬运 KV 块 tensor；编排入口
 > `ExternalExecutor.migrate_kv_cache_incremental(src_executor, src_blocks,
-> dst_blocks)` 只传输 `plan.transfer`，prefix_hit/unchanged 不动。
+> dst_blocks, transport=...)` 只传输 `plan.transfer`，prefix_hit/unchanged 不动。
+>
+> 传输后端（`kv_transport.py`，可插拔）：
+> ```python
+> class KVTransport(ABC):
+>     name: str
+>     def ship(self, src_executor, dst_executor, src_block_ids,
+>              block_mapping=None, timeout=300.0) -> int: ...
+>
+> class RayObjectStoreTransport(KVTransport):   # 默认: driver 中转, Ray TCP
+> class MooncakeRdmaTransport(KVTransport):     # P2P RDMA: worker put/get store
+> class KVTransportFactory:                     # create(name) / register(name, cls)
+>
+> # Mooncake worker 侧: export_kv_blocks_to_store -> KVBlockKey(store_key, block_id)
+> #                    import_kv_blocks_from_store(keys, block_mapping) -> count
+> ```
 >
 > 控制面（插件侧钩子，由 EngineCore `bind_scheduler` 触发）：
 > ```python
@@ -1203,6 +1218,7 @@ class Request:
 | `vllm_external_executor/node_registry_actor.py` | NodeRegistryActor：注册/心跳/统一视图/死检测 | ~279 |
 | `vllm_external_executor/migration.py` | 迁移状态机 + 原子事务 + 幂等 + FlightBatchPolicy | ~313 |
 | `vllm_external_executor/kv_migration.py` | KV 块增量迁移规划 + Prefix Caching 感知 | ~138 |
+| `vllm_external_executor/kv_transport.py` | KV 数据面传输后端（Ray TCP / Mooncake RDMA）+ 工厂 | ~180 |
 | `vllm_external_executor/cache_manager_actor.py` | CacheManagerActor 实现（G6） | ~474 |
 | `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~884 |
 | `examples/basic_usage.py` | 使用示例 | ~223 |
@@ -1211,6 +1227,8 @@ class Request:
 | `tests/test_global_scheduler.py` | 测试：GlobalScheduler 故障域调度 | ~137 |
 | `tests/test_migration.py` | 测试：迁移状态机 + 事务 + 幂等 | ~151 |
 | `tests/test_kv_migration.py` | 测试：KV 块增量 diff + prefix cache | ~110 |
+| `tests/test_kv_transport.py` | 测试：KV 传输后端（key 协议 + 工厂 + mock relay） | ~200 |
+| `tests/test_node_registry.py` | 测试：节点注册/心跳/死节点检测 | ~130 |
 | `tests/test_storage_checkpoint_engine.py` | 测试：nfs / mooncake_mock / mooncake | ~483 |
 | `verify_dependencies.sh` | 依赖验证脚本 | ~120 |
 
@@ -1661,8 +1679,9 @@ vLLM 核心修改（最小侵入，G5）：
       - transfer:    新增/修改且无 hash 命中 → 需搬运数据
   ⑤ assign_targets(): 异规格迁移时给 transfer 的唯一 src block 分配空闲 dst id
       (block_mapping: src_block_id -> dst_block_id); 同规格则 1:1 映射
-  ⑥ migrate_kv_cache_incremental(): 仅对 transfer 的 block 按 rank
-      export_kv_blocks → 重定向到 dst 块 → import_kv_blocks（数据面）
+  ⑥ migrate_kv_cache_incremental(): 仅对 transfer 的 block 按 rank 经
+      KVTransport.ship() 搬运（默认 ray_object_store: driver 中转；
+      mooncake_rdma: 源 worker put store → 目标 worker get，tensor 不经 driver）
   ⑦ import_prefix_cache(): 按 (dst_block_id, group_id, hash) 重建目标
       block_pool 的 prefix-cache 索引（一个 block 多 group 各一条）
   ⑧ restore_requests(): 目标端 from_engine_core_request 重建 Request →
@@ -1944,7 +1963,7 @@ vLLM 核心修改（最小侵入，G5）：
 | **KV Cache 大小变化** | 不同模型/并行策略可能需要不同大小的 KV Cache | 每次重新分配 KV Cache |
 | **分布式环境重建** | TP/PP 大小变化时需要重新初始化 NCCL/HCCl | 允许重新初始化，NPU 侧已预热所以很快 |
 | **switch_model 时序** | 热切换 (G3) 需要调用方保证无 in-flight 请求 | executor 层负责模型重建 + 存储加载 + KV cache 重分配 (已实现) |
-| **KV 数据面走 Ray TCP** | `export/import_kv_blocks` 经 Ray Object Store 跨节点传输，非 RDMA | 大 KV 迁移走 RDMA（Mooncake 已有权重后端，KV 侧可复用其 store 接口，待真机验证） |
+| **KV 数据面走 Ray TCP（默认）** | `export/import_kv_blocks` 经 Ray Object Store 跨节点传输，非 RDMA | 已抽象为 `KVTransport`：`mooncake_rdma` 后端走 P2P RDMA（worker put/get store，tensor 不经 driver）；骨架已落地，真机带宽/GPU-direct 优化待验证 |
 | **GDS 未实现** | GPUDirect Storage（GPU↔NVMe 直通）无后端，NFS 是 CPU 路径、Mooncake 是 RDMA 内存 | 需 cufile + GPUDirect 存储，作为 `StorageBackend` 新后端预留（硬件依赖，暂不落地） |
 | **编译等待硬编码** | 编译锁等待用 time.sleep(5) 轮询 | 改为事件通知/等待机制 |
 
