@@ -1601,14 +1601,20 @@ vLLM 核心修改（最小侵入，G5）：
 
 ## 5.3 场景 3：模型热切换
 
-> ✅ **实现状态：已实现（迁移状态机 + 原子事务 + 幂等）**。
-> `ExternalExecutor.switch_model()` 用 `MigrationStateMachine` 驱动
+> ✅ **实现状态：已实现（迁移状态机 + 原子事务 + 幂等 + 决策层接线）**。
+> `ExternalExecutor.switch_model()` 由 `MigrationOrchestrator` 驱动
 > PREPARING → GRACEFUL_PAUSE → CHECKPOINT → UNLOAD → LOAD → RESTORE →
-> COMPLETED；`migration_id` 保证请求级幂等；任一 worker 切换失败触发
+> COMPLETED，`migration_id` 保证请求级幂等；任一 worker 切换失败触发
 > 补偿回滚（已切换 worker 通过 `switch_model_rollback` 重载旧模型、
 > executor 配置引用恢复），原子回到迁移前状态。飞行中 batch 由
 > `FlightBatchPolicy`（drain / pause_serialize / preempt）+ `set_scheduler_gate`
 > 与 EngineCore 调度器协同。
+>
+> 决策层（`migration_orchestrator.py`）以 `phase_handlers` 注入执行侧动作
+> （GRACEFUL_PAUSE 暂停调度、CHECKPOINT 快照 worker、UNLOAD 切换 worker、
+> RESTORE 重建 KV cache），并产出 tiering 脚本（CHECKPOINT→REMOTE、UNLOAD→
+> DRAM、LOAD→HBM）与 `WeightShareLedger` 记账（base_hash/adapter 组合），
+> 为 LoRA 多任务共享 base 权重、仅切 adapter 的降本路径留好挂点。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -1983,7 +1989,7 @@ vLLM 核心修改（最小侵入，G5）：
 
 | 能力 | 现状 | 落地模块 | 边界 |
 |------|------|---------|------|
-| 三级分层存储（HBM/DRAM/REMOTE 自动换入换出） | 决策层已实现，**已接线到迁移状态机**（`migration_orchestrator.py`，`ExternalExecutor.migrate_kv_cache_to` 消费其脚本） | `storage_tier.py`（容量/LRU/升降级）+ `migration_orchestrator.py`（CHECKPOINT→REMOTE、UNLOAD→DRAM、LOAD→HBM 脚本） | `TieredCache` 只发 `EvictionDecision`，不搬张量；`ship()` 物理搬运与 `StorageBackend` 绑定的执行侧留真机 |
+| 三级分层存储（HBM/DRAM/REMOTE 自动换入换出） | 决策层已实现，**已接线到迁移状态机**（`migration_orchestrator.py`；`switch_model` 走 tiering 语义、`migrate_kv_cache_to` 走 advisory 记账） | `storage_tier.py`（容量/LRU/升降级）+ `migration_orchestrator.py`（CHECKPOINT→REMOTE、UNLOAD→DRAM、LOAD→HBM 脚本） | `TieredCache` 只发 `EvictionDecision`，不搬张量；`ship()`/worker 切换的物理搬运与 `StorageBackend` 绑定的执行侧留真机 |
 | 同节点零拷贝传输 | 骨架已实现 | `kv_transport.py::CudaIpcTransport` + worker `export/import_kv_blocks_ipc`（`share_ipc`/`from_ipc_handle`） | 仅同节点；`torch.from_ipc_handle` API 兼容性需真机验证 |
 | 全局 KV 前缀共享 | 索引已实现 | `global_prefix_index.py`（`GlobalPrefixIndex`，按 `weight_hash` 分 key） | **KV 张量是权重相关的**：仅同 `weight_hash`（同 base+adapter）的 Actor 可复用前缀；「跨模型」严格限于权重一致 |
 | 模型权重共享（LoRA 多任务） | 记账已实现 | `weight_sharing.py`（`WeightShareLedger` + `cost_ratio` 量化 adapter/基地成本比） | worker `switch_adapter` 执行路径未落地（需 vLLM LoRA runtime 对接，真机） |

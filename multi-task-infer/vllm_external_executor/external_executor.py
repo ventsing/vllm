@@ -189,12 +189,13 @@ class ExternalExecutor(RayExecutorV2):
         return
 
     # ------------------------------------------------------- migration helpers
-    def _weight_hash(self) -> str:
+    def _weight_hash(self, config: "VllmConfig | None" = None) -> str:
         """Stable weight-configuration hash for prefix/weight reuse groups."""
-        model = getattr(self.vllm_config.model_config, "model", "unknown")
-        tp = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
+        config = config or self.vllm_config
+        model = getattr(config.model_config, "model", "unknown")
+        tp = getattr(config.parallel_config, "tensor_parallel_size", 1)
         pp = getattr(
-            self.vllm_config.parallel_config, "pipeline_parallel_size", 1
+            config.parallel_config, "pipeline_parallel_size", 1
         )
         return f"{model}@tp{tp}pp{pp}"
 
@@ -631,15 +632,22 @@ class ExternalExecutor(RayExecutorV2):
             MigrationSpec,
         )
 
+        new_weight_hash = self._weight_hash(new_vllm_config)
         spec = MigrationSpec(
             migration_id=migration_id or uuid.uuid4().hex,
             target=getattr(new_vllm_config.model_config, "model", "unknown"),
             policy=FlightBatchPolicy(flight_batch_policy),
+            payload={
+                "target_checkpoint": checkpoint_path or f"ckpt:{new_weight_hash}",
+                "checkpoint_bytes": 0,  # advisory; filled from real tensors
+                "base_bytes": 0,        # advisory; filled from real tensors
+                "base_hash": new_weight_hash,
+                "adapter": None,
+            },
         )
 
         def orchestrate(sm):
-            # PREPARING: validate preconditions.
-            sm.transition(MigrationPhase.PREPARING)
+            # PREPARING precondition check (world_size stability).
             parallel_config = new_vllm_config.parallel_config
             if parallel_config.world_size != self.world_size:
                 raise ValueError(
@@ -649,52 +657,71 @@ class ExternalExecutor(RayExecutorV2):
                     f"Change TP/PP via release+acquire."
                 )
 
-            # GRACEFUL_PAUSE: hand off to the engine-core scheduler gate.
-            sm.transition(MigrationPhase.GRACEFUL_PAUSE)
-            self._pause_for_migration(sm)
-            # Resume scheduling on BOTH success (explicit call after RESTORE)
-            # and rollback (this compensation runs last), so the scheduler is
-            # never left paused by a failed migration.
-            sm.register_compensation(
-                lambda: self._resume_after_migration(sm)
-            )
+            snapshots_box: list = []
 
-            # CHECKPOINT: snapshot executor config + every worker's state.
-            sm.transition(MigrationPhase.CHECKPOINT)
-            old_config = self.vllm_config
-            sm.register_compensation(
-                lambda: setattr(self, "vllm_config", old_config)
-            )
-            snapshots = ray.get(
-                [
-                    h.actor.switch_model_snapshot.remote()
-                    for h in self.ray_worker_handles
-                ],
-                timeout=_MIGRATION_RPC_TIMEOUT,
-            )
+            def on_graceful_pause(_sm, _script):
+                self._pause_for_migration(_sm)
+                # Resume on success (RESTORE) and rollback (compensation runs
+                # last), so the scheduler is never left paused.
+                _sm.register_compensation(
+                    lambda: self._resume_after_migration(_sm)
+                )
 
-            # UNLOAD + LOAD: switch every worker, with per-worker rollback.
-            sm.transition(MigrationPhase.UNLOAD)
-            self._switch_all_workers(
-                new_vllm_config,
-                checkpoint_path,
-                storage_backend,
-                storage_config,
-                weight_transfer_init_info,
-                snapshots,
-                sm,
+            def on_checkpoint(_sm, _script):
+                old_config = self.vllm_config
+                _sm.register_compensation(
+                    lambda: setattr(self, "vllm_config", old_config)
+                )
+                snapshots_box.extend(
+                    ray.get(
+                        [
+                            h.actor.switch_model_snapshot.remote()
+                            for h in self.ray_worker_handles
+                        ],
+                        timeout=_MIGRATION_RPC_TIMEOUT,
+                    )
+                )
+
+            def on_unload(_sm, _script):
+                self._switch_all_workers(
+                    new_vllm_config,
+                    checkpoint_path,
+                    storage_backend,
+                    storage_config,
+                    weight_transfer_init_info,
+                    list(snapshots_box),
+                    _sm,
+                )
+
+            def on_restore(_sm, _script):
+                if reinitialize_cache:
+                    self._reinitialize_kv_cache()
+                self._handle_compilation_optimization()
+                self._resume_after_migration(_sm)
+
+            _sm, script = self._orchestrator.migrate(
+                spec,
+                actor_id=self._actor_id(),
+                candidates={},
+                resident=set(),
+                phase_handlers={
+                    MigrationPhase.GRACEFUL_PAUSE: on_graceful_pause,
+                    MigrationPhase.CHECKPOINT: on_checkpoint,
+                    MigrationPhase.UNLOAD: on_unload,
+                    MigrationPhase.RESTORE: on_restore,
+                },
+                sm=sm,
             )
-            sm.transition(MigrationPhase.LOAD)
-
-            # RESTORE: re-allocate KV cache + compile, then resume.
-            sm.transition(MigrationPhase.RESTORE)
-            if reinitialize_cache:
-                self._reinitialize_kv_cache()
-            self._handle_compilation_optimization()
-            self._resume_after_migration(sm)
-
-            sm.transition(MigrationPhase.COMPLETED)
-            logger.info("Model switch complete (%s)", sm.progress())
+            logger.info(
+                "Model switch complete (%s; script prefetch=%d, "
+                "tier_moves=%d, weight_register=%d)",
+                _sm.progress(),
+                len(script.prefetch_keys),
+                len(script.checkpoint_moves)
+                + len(script.unload_moves)
+                + len(script.load_moves),
+                len(script.weight_register),
+            )
 
         return self._migration_registry.run(spec, orchestrate)
 

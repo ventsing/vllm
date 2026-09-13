@@ -114,6 +114,10 @@ class MigrationOrchestrator:
         actor_id: str,
         candidates: dict[str, int],
         resident: set[str] | None = None,
+        phase_handlers: dict[
+            MigrationPhase, Callable[[MigrationStateMachine, MigrationScript], None]
+        ] | None = None,
+        sm: MigrationStateMachine | None = None,
     ) -> tuple[MigrationStateMachine, MigrationScript]:
         """Run the full happy path, returning the machine and its script.
 
@@ -122,13 +126,23 @@ class MigrationOrchestrator:
             actor_id: Actor being migrated (prefix/weight ledger owner).
             candidates: ``key -> size_bytes`` for prefetch ranking.
             resident: Keys already resident (excluded from prefetch).
+            phase_handlers: Optional per-phase execution callbacks. Each runs
+                after the orchestrator has finished that phase's decisions (so
+                the executor can, e.g., pause the scheduler at GRACEFUL_PAUSE,
+                fan out worker switches at UNLOAD, or re-init KV at RESTORE).
+                Signature: ``(state_machine, script) -> None``.
+            sm: Optional externally-owned state machine to drive (e.g. one
+                created by :class:`MigrationIdempotencyRegistry`), preserving
+                the caller's idempotency/rollback wrapping. Defaults to a new
+                machine.
 
         Returns:
             ``(state_machine, script)``; the machine ended in COMPLETED.
         """
+        handlers = phase_handlers or {}
         now = time.monotonic()
         resident = resident or set()
-        sm = MigrationStateMachine(spec)
+        sm = sm or MigrationStateMachine(spec)
         script = MigrationScript(spec.migration_id)
 
         # The current weights start resident in HBM (the caller may already
@@ -148,25 +162,37 @@ class MigrationOrchestrator:
         sm.on_enter(MigrationPhase.LOAD, self._hook_await_load())
 
         sm.transition(MigrationPhase.PREPARING)
+        self._run_handler(handlers, MigrationPhase.PREPARING, sm, script)
         sm.transition(MigrationPhase.GRACEFUL_PAUSE)
+        self._run_handler(handlers, MigrationPhase.GRACEFUL_PAUSE, sm, script)
 
         sm.transition(MigrationPhase.CHECKPOINT)
         script.checkpoint_moves = self._stage_checkpoint(spec, now)
         self._register_tier_undo(sm, script.checkpoint_moves)
+        self._run_handler(handlers, MigrationPhase.CHECKPOINT, sm, script)
 
         sm.transition(MigrationPhase.UNLOAD)
         script.unload_moves = self._demote_current(spec, now)
         self._register_tier_undo(sm, script.unload_moves)
+        self._run_handler(handlers, MigrationPhase.UNLOAD, sm, script)
 
         sm.transition(MigrationPhase.LOAD)  # fires await_prefetch
         script.load_moves = self._promote_target(spec, now)
         self._register_tier_undo(sm, script.load_moves)
+        self._run_handler(handlers, MigrationPhase.LOAD, sm, script)
 
         sm.transition(MigrationPhase.RESTORE)
         self._restore_metadata(spec, actor_id, script, sm)
+        self._run_handler(handlers, MigrationPhase.RESTORE, sm, script)
 
         sm.transition(MigrationPhase.COMPLETED)
         return sm, script
+
+    @staticmethod
+    def _run_handler(handlers, phase, sm, script) -> None:
+        handler = handlers.get(phase)
+        if handler is not None:
+            handler(sm, script)
 
     # ---------------------------------------------------------------- hooks
     def _hook_prepare(self, script, candidates, resident, now):
