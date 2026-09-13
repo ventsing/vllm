@@ -1222,6 +1222,7 @@ class Request:
 | `vllm_external_executor/cache_manager_actor.py` | CacheManagerActor 实现（G6） | ~474 |
 | `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~884 |
 | `examples/basic_usage.py` | 使用示例 | ~223 |
+| `examples/kv_incremental_migration.py` | 增量 KV 迁移 + 跨节点故障转移示例 | ~150 |
 | `examples/verify_multi_task_sharing.py` | 多任务共享验证脚本 | ~369 |
 | `examples/mooncake_config.json` | Mooncake 配置模板 | ~10 |
 | `tests/test_global_scheduler.py` | 测试：GlobalScheduler 故障域调度 | ~137 |
