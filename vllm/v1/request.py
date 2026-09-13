@@ -262,6 +262,64 @@ class Request:
             abort_immediately=request.abort_immediately,
         )
 
+    def to_engine_core_request(self) -> EngineCoreRequest:
+        """Serialize the admission inputs for cross-engine migration.
+
+        Running state (generated tokens, compute position, block table) is
+        transferred separately by the KV-migration control plane, so this
+        mirrors :meth:`from_engine_core_request` without it.
+        """
+        reasoning_ended = None
+        reasoning_parser_kwargs = None
+        if self.structured_output_request is not None:
+            reasoning_ended = self.structured_output_request.reasoning_ended
+            reasoning_parser_kwargs = (
+                self.structured_output_request.reasoning_parser_kwargs
+            )
+        return EngineCoreRequest(
+            request_id=self.request_id,
+            prompt_token_ids=self.prompt_token_ids,
+            mm_features=self.mm_features or None,
+            sampling_params=self.sampling_params,
+            pooling_params=self.pooling_params,
+            arrival_time=self.arrival_time,
+            lora_request=self.lora_request,
+            cache_salt=self.cache_salt,
+            priority=self.priority,
+            trace_headers=self.trace_headers,
+            resumable=self.resumable,
+            session_id=self.session_id,
+            client_index=self.client_index,
+            prompt_embeds=self.prompt_embeds,
+            prompt_is_token_ids=self.prompt_is_token_ids,
+            reasoning_ended=reasoning_ended,
+            reasoning_parser_kwargs=reasoning_parser_kwargs,
+        )
+
+    def restore_running_state(
+        self,
+        all_token_ids: list[int],
+        output_token_ids: list[int],
+        num_computed_tokens: int,
+    ) -> None:
+        """Restore generated tokens and compute position after migration.
+
+        Rebuilds the full token sequence and points the compute cursor at the
+        migrated KV position so the target scheduler resumes where the source
+        left off.
+
+        Args:
+            all_token_ids: Complete token sequence (prompt + generated) from
+                the source request.
+            output_token_ids: Tokens already generated and delivered on the
+                source request.
+            num_computed_tokens: Source request's KV compute position.
+        """
+        self._all_token_ids = list(all_token_ids)
+        self._output_token_ids = list(output_token_ids)
+        self.num_computed_tokens = num_computed_tokens
+        self.update_block_hashes()
+
     def append_output_token_ids(
         self,
         token_ids: int | list[int],
