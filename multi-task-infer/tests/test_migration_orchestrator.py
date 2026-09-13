@@ -173,5 +173,47 @@ def test_prefetch_skips_resident_and_over_budget():
     assert started == [["hot"]]
 
 
+def test_kv_migration_semantics_prefetch_and_index():
+    """Executor glue: hot non-resident prefixes prefetched; transfer indexed.
+
+    Mirrors ``ExternalExecutor._drive_migration_orchestrator``: candidates are
+    source prefixes, resident are destination prefixes, and only the
+    ``transfer`` blocks become prefix entries (remapped to dst ids).
+    """
+    heat = AccessHeatTracker(0.9)
+    heat.record("hot:0", 1.0)
+    heat.record("hot:0", 2.0)
+    heat.record("cold:0", 1.0)  # colder than hot, present on source
+
+    started = []
+    orchestrator = _build(
+        _spec(), heat=heat, budget=1,
+        start=lambda keys: started.append(list(keys)),
+    )
+
+    spec = MigrationSpec(
+        target="kv-migrate:wA",
+        payload={
+            "target_checkpoint": "kv:wA",
+            "checkpoint_bytes": 2,
+            "prefix_entries": [
+                PrefixEntry("hot", 0, "wA", "dst0", "n1", 11, refs=1),
+                PrefixEntry("cold", 0, "wA", "dst0", "n1", 13, refs=1),
+            ],
+        },
+    )
+    sm, script = orchestrator.migrate(
+        spec, actor_id="dst0",
+        candidates={"hot:0": 1, "cold:0": 1, "already:0": 1},
+        resident={"already:0"},
+    )
+
+    # Budget=1 unit picks only the hottest non-resident prefix.
+    assert started == [["hot:0"]]
+    assert script.prefix_register[0].actor_id == "dst0"
+    assert [e.content_hash for e in script.prefix_register] == ["hot", "cold"]
+    assert sm.phase.value == "completed"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

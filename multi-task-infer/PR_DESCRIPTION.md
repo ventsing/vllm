@@ -24,10 +24,13 @@ Adds an `ExternalExecutor` plugin for vLLM V1 that:
   three-tier hierarchy (HBM/DRAM/REMOTE) with swap decisions, a
   cross-actor prefix index, a base+adapter weight-share ledger, and
   access-heat prefetch ranking (pure-logic, unit-tested). These are wired to
-  the migration state machine via `migration_orchestrator.py`: an async
-  prefetch hook (nominated at PREPARING, awaited at LOAD) and tiering-driven
-  checkpoint movement (CHECKPOINT→REMOTE, UNLOAD→DRAM, LOAD→HBM) with
-  compensation-based rollback of the decision bookkeeping.
+  the migration state machine via `migration_orchestrator.py` and consumed by
+  `ExternalExecutor`: `migrate_kv_cache_to(prefetch=...)` drives the async
+  prefetch hook (hot, non-resident prefixes nominated at PREPARING and awaited
+  at LOAD) and registers transferred prefixes on the shared
+  `GlobalPrefixIndex`; the state machine also emits tiering-driven checkpoint
+  movement (CHECKPOINT→REMOTE, UNLOAD→DRAM, LOAD→HBM) with compensation-based
+  rollback of its own bookkeeping.
 
 The plugin lives entirely under `multi-task-infer/` and hooks vLLM through the
 existing `vllm.general_plugins` entry point; core changes are intentionally
@@ -164,9 +167,11 @@ completion on A. Pending hardware validation:
   (cross-actor prefix reuse), `weight_sharing` (base+adapter ledger),
   `prefetch_policy` (async prefetch ranking). `migration_orchestrator.py`
   wires the tiering/prefetch decisions into the state machine (async prefetch
-  hook + tiered checkpoint movement + compensation rollback), but the
-  `start_prefetch`/`await_prefetch` callbacks are no-ops by default and the
-  physical `ship()`/tensor moves still need a GPU runtime to execute; the
+  hook + tiered checkpoint movement + compensation rollback), and
+  `ExternalExecutor.migrate_kv_cache_to` consumes that script (prefetch
+  nomination + `GlobalPrefixIndex` registration). The
+  `_start_prefetch`/`_await_prefetch` callbacks are no-op+log by default and
+  the physical `ship()`/tensor moves still need a GPU runtime to execute; the
   decision layer is offline-tested.
 - Cross-model prefix sharing is valid only for identical `weight_hash`
   (same base + adapter); KV tensors are weight-dependent.
