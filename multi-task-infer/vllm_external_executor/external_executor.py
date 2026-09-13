@@ -785,6 +785,38 @@ class ExternalExecutor(RayExecutorV2):
         self._scheduler.kv_cache_manager.block_pool.import_block_hashes(by_block)
         return len(by_block)
 
+    def import_request_blocks(
+        self,
+        request_id: str,
+        block_ids_by_group: list[list[int]],
+        block_id_to_hashes: dict | None = None,
+    ) -> None:
+        """Attach pre-filled KV blocks to an admitted request's block table.
+
+        Final scheduler-side step of cross-engine KV migration: after the data
+        plane copied the block tensors, this occupies them (ref-count + free
+        queue) and points the request's per-group block table at them, without
+        an ``allocate_slots`` lookup. The request must already be admitted to
+        the target scheduler.
+
+        Args:
+            request_id: Target request id (already added via ``add_request``).
+            block_ids_by_group: Destination physical ids per KV cache group.
+                Length must equal the number of KV cache groups.
+            block_id_to_hashes: Optional ``block_id -> [hash...]`` to restore
+                into the prefix cache (as produced by the diff/planner).
+        """
+        if self._scheduler is None:
+            raise RuntimeError(
+                "scheduler not bound; this executor requires the EngineCore "
+                "bind_scheduler hook"
+            )
+        self._scheduler.kv_cache_manager.import_request_blocks(
+            request_id,
+            block_ids_by_group,
+            block_id_to_hashes=block_id_to_hashes,
+        )
+
     def migrate_kv_cache_incremental(
         self,
         src_executor: "ExternalExecutor",

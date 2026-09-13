@@ -697,6 +697,30 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def import_request_blocks(
+        self,
+        request_id: str,
+        block_ids_by_group: Sequence[Sequence[int]],
+        block_id_to_hashes: dict | None = None,
+    ) -> None:
+        """Attach pre-filled KV blocks to a request's block table.
+
+        For incremental KV migration: after the data plane copied block
+        tensors into the destination workers, this occupies them (ref-count +
+        free queue) and points the request's per-group block table at them,
+        without an ``allocate_slots`` lookup (which would pick arbitrary free
+        blocks). Optionally restores the prefix-cache hashes first.
+
+        Args:
+            request_id: Target request already admitted to the scheduler.
+            block_ids_by_group: Destination physical ids per KV cache group.
+            block_id_to_hashes: Optional ``block_id -> iterable of hashes`` to
+                register into the prefix cache (one or more per group).
+        """
+        if block_id_to_hashes:
+            self.block_pool.import_block_hashes(block_id_to_hashes)
+        self.coordinator.import_request_blocks(request_id, block_ids_by_group)
+
     def get_block_ids_for_computed_tokens(
         self,
         request_id: str,

@@ -488,11 +488,15 @@ class BlockIdAllocator:
 >     def bind_scheduler(self, scheduler) -> None: ...   # 拿 block_pool 源真相
 >     def snapshot_kv_blocks(self) -> list[KVBlockRef]:  # 遍历 block_pool.blocks
 >     def import_prefix_cache(self, block_id_to_hash) -> int:  # 重建 prefix 索引
+>     def import_request_blocks(self, request_id, block_ids_by_group,
+>                               block_id_to_hashes=None):  # 挂载块到请求 block table
 >     def migrate_kv_cache_to(self, target_executor):    # 端到端增量迁移编排
 > ```
-> 核心改动 2 处：`vllm/v1/engine/core.py`（scheduler 构造后调用
+> 核心改动 3 处：`vllm/v1/engine/core.py`（scheduler 构造后调用
 > `executor.bind_scheduler`，no-op 默认值）；`vllm/v1/core/block_pool.py`
-> （公开 `BlockPool.import_block_hashes` 幂等重建 prefix 索引）。详见 §5.3.2。
+> （公开 `BlockPool.import_block_hashes` 幂等重建 prefix 索引）；
+> `vllm/v1/core/kv_cache_manager.py` + `kv_cache_coordinator.py`（公开
+> `import_request_blocks` 挂载块到请求 block table）。详见 §3.3.9 / §5.3.2。
 
 ---
 
@@ -1123,6 +1127,28 @@ class BlockPool:
                 self._insert_block_hash(block_hash, block, num_tokens=None)
 ```
 
+### 3.3.9 import_request_blocks（挂载块到请求 block table）
+
+```python
+# vllm/v1/core/kv_cache_coordinator.py
+class HybridKVCacheCoordinator:
+    def import_request_blocks(self, request_id, block_ids_by_group) -> None:
+        """把预填好的 KV 块挂到请求的 block table（占用 + 引用, 不走 allocate_slots）。"""
+        for manager, block_ids in zip(self.single_type_managers, block_ids_by_group):
+            blocks = [self.block_pool.blocks[i] for i in block_ids]
+            self.block_pool.touch(blocks)          # ref_cnt+1 + 出 free queue
+            manager.req_to_blocks[request_id] = blocks
+
+# vllm/v1/core/kv_cache_manager.py
+class KVCacheManager:
+    def import_request_blocks(self, request_id, block_ids_by_group,
+                              block_id_to_hashes=None) -> None:
+        """先挂 prefix hash(可选), 再挂请求 block table。"""
+        if block_id_to_hashes:
+            self.block_pool.import_block_hashes(block_id_to_hashes)
+        self.coordinator.import_request_blocks(request_id, block_ids_by_group)
+```
+
 ## 3.4 新增文件清单
 
 | 文件 | 说明 | 实际行数 |
@@ -1595,19 +1621,28 @@ vLLM 核心修改（最小侵入，G5）：
        export_kv_blocks → 重定向到 dst 块 → import_kv_blocks（数据面）
   ⑥ import_prefix_cache(): 按 (dst_block_id, group_id, hash) 重建目标
        block_pool 的 prefix-cache 索引（一个 block 多 group 各一条）
-  ⑦ 恢复调度 (resume)
+  ⑦ import_request_blocks(): 跨 engine 迁移的最后一步 — 把预填的 dst 块
+       挂到目标端已 add_request 的请求 block table（touch 占用 + ref_cnt +
+       出 free queue），不走 allocate_slots; 仅同 EngineCore 迁移时此步为 no-op
+  ⑧ 恢复调度 (resume)
 
   效果: 长上下文续写/多轮对话只迁「增量 KV 块」，公共前缀复用已缓存块（含
         跨 group 隔离 + 跨节点/异规格映射），迁移成本 O(新增+修改块)。
 
-  核心改动(2 处, 极小):
+  核心改动(3 处, 极小):
   1. vllm/v1/engine/core.py: scheduler 构造后若 executor 有 bind_scheduler
      钩子则调用 — 让插件拿到 scheduler(块表源真相), 默认 executor no-op。
   2. vllm/v1/core/block_pool.py: 公开 BlockPool.import_block_hashes() 支持
      一个 block 多 group hash — 数据面写完 KV tensor 后重建 prefix 索引(幂等)。
+  3. vllm/v1/core/kv_cache_manager.py + kv_cache_coordinator.py: 公开
+     import_request_blocks() — 挂载块到请求 block table（只有跨 engine 迁移
+     才需要；同 EngineCore 迁移数据 1:1、请求 block table 不变，无需此步）。
   其余全在插件 vllm_external_executor/: bind_scheduler / snapshot_kv_blocks /
-  import_prefix_cache / migrate_kv_cache_to(端到端编排, 支持异规格 remap)。
+  import_prefix_cache / import_request_blocks / migrate_kv_cache_to。
 ```
+
+> 跨 EngineCore 请求状态序列化（Request 对象 + 采样状态 + token 状态）仍是
+> 剩余边界：真实跨节点迁移需目标端先 add_request 再 import_request_blocks。
 
 ## 5.4 场景 4：弹性伸缩（TP/PP 变化）
 

@@ -400,6 +400,30 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def import_request_blocks(
+        self,
+        request_id: str,
+        block_ids_by_group: Sequence[Sequence[int]],
+    ) -> None:
+        """Attach pre-filled KV blocks to a request's block table.
+
+        For incremental KV migration: the data plane has already copied block
+        tensors into these physical ids. This occupies them (ref-count + free
+        queue) and points the request's per-group block table at them, without
+        going through ``allocate_slots`` (which would pick arbitrary free
+        blocks and run a prefix-cache lookup).
+
+        Args:
+            request_id: Target request already admitted to the scheduler.
+            block_ids_by_group: Destination physical ids per KV cache group.
+        """
+        for manager, block_ids in zip(
+            self.single_type_managers, block_ids_by_group
+        ):
+            blocks = [self.block_pool.blocks[i] for i in block_ids]
+            self.block_pool.touch(blocks)
+            manager.req_to_blocks[request_id] = blocks
+
     @abstractmethod
     def find_longest_cache_hit(
         self,
