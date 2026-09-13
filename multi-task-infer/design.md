@@ -1223,6 +1223,7 @@ class Request:
 | `vllm_external_executor/global_prefix_index.py` | 跨 Actor 全局前缀哈希索引（同权重可复用，纯逻辑） | ~130 |
 | `vllm_external_executor/weight_sharing.py` | base+adapter 权重共享记账 + 迁移成本量化（纯逻辑） | ~100 |
 | `vllm_external_executor/prefetch_policy.py` | 访问热度追踪 + 异步预取决策（纯逻辑） | ~110 |
+| `vllm_external_executor/migration_orchestrator.py` | 决策层→迁移状态机接线：异步预取 hook + tiering 搬运脚本 | ~220 |
 | `vllm_external_executor/cache_manager_actor.py` | CacheManagerActor 实现（G6） | ~474 |
 | `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~884 |
 | `examples/basic_usage.py` | 使用示例 | ~223 |
@@ -1235,6 +1236,7 @@ class Request:
 | `tests/test_kv_transport.py` | 测试：KV 传输后端（key 协议 + 工厂 + mock relay） | ~200 |
 | `tests/test_storage_tier.py` | 测试：分层存储换入换出 + 预取决策 | ~150 |
 | `tests/test_global_prefix_index.py` | 测试：全局前缀索引 + 权重共享记账 | ~130 |
+| `tests/test_migration_orchestrator.py` | 测试：orchestrator 预取 hook + tiering 脚本 + 补偿 | ~160 |
 | `tests/test_node_registry.py` | 测试：节点注册/心跳/死节点检测 | ~130 |
 | `tests/test_storage_checkpoint_engine.py` | 测试：nfs / mooncake_mock / mooncake | ~483 |
 | `verify_dependencies.sh` | 依赖验证脚本 | ~120 |
@@ -1981,11 +1983,11 @@ vLLM 核心修改（最小侵入，G5）：
 
 | 能力 | 现状 | 落地模块 | 边界 |
 |------|------|---------|------|
-| 三级分层存储（HBM/DRAM/REMOTE 自动换入换出） | 决策层已实现，执行层接线待真机 | `storage_tier.py`（`StorageTier` + `TieredCache` 容量/LRU/升降级决策） | `TieredCache` 只发 `EvictionDecision` 指令，不搬张量；与 `StorageBackend` 的绑定沿用「Ray Object Store(<50MB) + NFS/Mooncake(≥50MB)」既有接线 |
+| 三级分层存储（HBM/DRAM/REMOTE 自动换入换出） | 决策层已实现，**已接线到迁移状态机**（`migration_orchestrator.py`） | `storage_tier.py`（容量/LRU/升降级）+ `migration_orchestrator.py`（CHECKPOINT→REMOTE、UNLOAD→DRAM、LOAD→HBM 脚本） | `TieredCache` 只发 `EvictionDecision`，不搬张量；`ship()` 物理搬运与 `StorageBackend` 绑定的执行侧留真机 |
 | 同节点零拷贝传输 | 骨架已实现 | `kv_transport.py::CudaIpcTransport` + worker `export/import_kv_blocks_ipc`（`share_ipc`/`from_ipc_handle`） | 仅同节点；`torch.from_ipc_handle` API 兼容性需真机验证 |
 | 全局 KV 前缀共享 | 索引已实现 | `global_prefix_index.py`（`GlobalPrefixIndex`，按 `weight_hash` 分 key） | **KV 张量是权重相关的**：仅同 `weight_hash`（同 base+adapter）的 Actor 可复用前缀；「跨模型」严格限于权重一致 |
 | 模型权重共享（LoRA 多任务） | 记账已实现 | `weight_sharing.py`（`WeightShareLedger` + `cost_ratio` 量化 adapter/基地成本比） | worker `switch_adapter` 执行路径未落地（需 vLLM LoRA runtime 对接，真机） |
-| 异步 I/O 与预取 | 决策已实现 | `prefetch_policy.py`（`AccessHeatTracker` + `PrefetchPolicy` 热度排序/预算裁剪） | 后台加载线程/流水线执行未落地（真机，与迁移状态机异步化联动） |
+| 异步 I/O 与预取 | 决策已实现，**hook 已接线**（PREPARING 启动 / LOAD 前 await，`migration.py::on_enter` + `migration_orchestrator.py`） | `prefetch_policy.py`（热度/预算）+ `migration.py` 阶段钩子 + `migration_orchestrator.py::_hook_prepare/_hook_await_load` | `start_prefetch`/`await_prefetch` 默认 no-op，执行侧注入后台线程后即真正异步；线程/流水线执行留真机 |
 
 ---
 
