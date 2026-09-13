@@ -1,202 +1,159 @@
-# ExternalExecutor Plugin: Actor Pooling + Storage Backend
+# [ExternalExecutor] Pre-started Ray actor pool, model hot-switching, and cross-node KV migration
+
+> PR description draft — copy into GitHub when opening the PR. Branch:
+> `feature/external-executor` (14 commits, `4ba3dc4eab..3f9a6356fe`).
 
 ## Summary
 
-This PR introduces **ExternalExecutor**, a vLLM plugin that enables actor pooling, compilation cache sharing, and storage-based weight loading for faster multi-task inference.
+Adds an `ExternalExecutor` plugin for vLLM V1 that:
 
-## Key Features
+- Runs workers on a **pre-started Ray Actor pool** (no per-engine Ray actor
+  startup cost), with a detached `NodeRegistryActor`, fault-domain-aware
+  `GlobalScheduler`, and automatic **actor-level and node-level failover**.
+- Supports **model hot-switching** and dynamic TP/PP via the executor, with
+  `StorageCheckpointEngine` for weight loading (`NFSStorageBackend` over TCP,
+  `MooncakeStoreBackend` over RDMA) and `weight_transfer` as an alternative.
+- Shares **torch.compile caches** across engines (small caches via Ray Object
+  Store, large via NFS + gzip compression).
+- Migrates a live engine's **KV cache incrementally** to another engine
+  (prefix-cache aware; heterogeneous block-id remapping), restores in-flight
+  requests, and moves KV tensors over a **pluggable transport**
+  (`ray_object_store` default, `mooncake_rdma` peer-to-peer optional).
 
-### 1. Actor Pooling
-- Pre-start Ray Actors bound to GPU/NPU devices
-- Reuse actors across multiple vLLM instances
-- Eliminate initialization overhead (device setup, library imports, NCCL/HCCl warmup)
+The plugin lives entirely under `multi-task-infer/` and hooks vLLM through the
+existing `vllm.general_plugins` entry point; core changes are intentionally
+minimal.
 
-### 2. Compilation Cache Sharing
-- **CacheManagerActor**: Independent Ray Actor managing torch.compile caches
-- **Lazy-loading pattern**: Check local → Pull from manager → Fallback compile
-- **Compile lock**: Prevents duplicate compilation across nodes
-- **Hybrid storage**: Ray Object Store (<50MB) + NFS compression (>=50MB)
+## Why this is not a duplicate
 
-### 3. Storage Checkpoint Engine
-- Load model weights from persistent storage (NFS/Mooncake Store)
-- Compatible with verl's `CheckpointEngineWithCache` interface
-- Can register to verl's `CheckpointEngineRegistry`
+- Existing vLLM executors (`RayExecutorV2`, `ExternalExecutor` variants in-tree)
+  create workers per engine and do not pool actors across engine lifetimes.
+- This PR adds **cross-engine KV migration** (incremental, prefix-cache aware,
+  heterogeneous remap) plus a transport abstraction, which the in-tree
+  `ExternalExecutor`/`RayExecutorV2` do not implement.
+- Maintainer must confirm with `gh pr list` (commands in the pre-submit
+  checklist below); no duplicate was identified from the checked-out history.
 
-## Storage Backends
+## Core changes (minimal, 8 files, +159 / −2 lines)
 
-| Backend | Status | Performance | Use Case |
-|---------|--------|-------------|----------|
-| **NFS** | ✅ Implemented | Depends on network | Shared filesystem, simple setup |
-| **Mooncake Store** | ✅ Implemented | ~9 GB/s (InfiniBand) | Large-scale clusters, RDMA |
+| File | Change |
+|------|--------|
+| `vllm/v1/engine/async_llm.py` | +5 — accept `external_actors` and pass to the engine client |
+| `vllm/v1/engine/core_client.py` | +9 — thread `external_actors` through MP clients |
+| `vllm/v1/engine/utils.py` | +4 — thread `external_actors` into `launch_core_engines` |
+| `vllm/v1/engine/core.py` | +17/−1 — pass `external_actors` to the executor; call `bind_scheduler(self.scheduler)` when the executor exposes it |
+| `vllm/v1/request.py` | +58 — `Request.from_engine_core_request` / `to_engine_core_request` / `restore_running_state` (request snapshot/restore for cross-engine migration) |
+| `vllm/v1/core/block_pool.py` | +20 — read accessors for KV-block snapshot (block hash / group id) |
+| `vllm/v1/core/kv_cache_manager.py` | +24 — `get_block_ids_for_computed_tokens` (per-group crop to computed tokens) |
+| `vllm/v1/core/kv_cache_coordinator.py` | +24 — request→block-table accessor for request restore |
 
-## Architecture
+The `bind_scheduler` hook is a no-op for stock executors; the plugin is the
+only caller. `external_actors` is `None` for stock paths, so behavior is
+unchanged.
+
+## Plugin layout (all new, under `multi-task-infer/`)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              Storage (NFS/Mooncake Store)                        │
-│  - Model checkpoints (safetensors)                               │
-│  - Compilation caches                                            │
-└─────────────────────────────────────────────────────────────────┘
-         │                              │
-         ↓                              ↓
-┌─────────────────────┐    ┌─────────────────────────────────────┐
-│  StorageCheckpoint  │    │        CacheManagerActor            │
-│     Engine          │    │  - Compilation cache sharing         │
-│  - Load model       │    │  - pull/push API                     │
-│    weights          │    │  - Compile lock coordination         │
-└─────────────────────┘    └─────────────────────────────────────┘
-         │                              │
-         ↓                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│              ExternalExecutor Workers                            │
-│  - Pre-started Ray Actors bound to GPU/NPU devices              │
-│  - Load model via StorageCheckpointEngine                       │
-│  - Share compilation cache via CacheManagerActor                │
-└─────────────────────────────────────────────────────────────────┘
+vllm_external_executor/
+  external_executor.py          # ExternalExecutor + incremental KV migration + transport
+  actor_pool_manager.py         # ActorPoolManager: pre-start/acquire/release + failover
+  external_worker_actor.py      # ExternalWorkerActor: device bind + export/import KV
+  cluster_state.py              # NodeInfo / ActorRegistration / GlobalScheduler (pure)
+  node_registry_actor.py        # NodeRegistryActor: registration + heartbeat + dead detection
+  migration.py                  # MigrationPhase state machine + atomic transactions
+  kv_migration.py               # IncrementalKVPlanner (prefix-cache aware diff)
+  kv_transport.py               # KVTransport ABC + Ray/Mooncake backends + factory
+  cache_manager_actor.py        # compile-cache sharing (G6)
+  storage_checkpoint_engine.py  # NFS / Mooncake backends (G7)
+tests/                          # 6 test modules (pytest, pure-logic where possible)
+examples/                       # basic usage + incremental migration/failover sketches
+design.md                       # full design doc (4+1 view)
 ```
 
-## Performance
-
-| Scenario | Without Sharing | With Sharing |
-|----------|----------------|--------------|
-| First node (compile) | 30-180s | 30-180s |
-| Second node | 30-180s | 5-10s (cache pull) |
-| Subsequent | 5-10s (local) | 5-10s (local) |
-
-## Usage Example
+## Usage
 
 ```python
-from vllm_external_executor import ActorPoolManager, ExternalExecutor
+# Two engines share a pre-started pool; migrate live KV between them.
+src = src_llm.llm_engine.model_executor
+dst = dst_llm.llm_engine.model_executor
 
-# 1. Create ActorPoolManager (auto-creates CacheManagerActor)
-pool = ActorPoolManager()
-pool.pre_start(
-    num_actors=8,
-    devices_per_node=[0, 1, 2, 3, 4, 5, 6, 7],
-    warmup_distributed=True,
-    shared_cache_dir="/shared/vllm_compile_cache",
-)
+# Same-layout (ids 1:1), default Ray Object Store transport:
+plan = src.migrate_kv_cache_to(dst)
 
-# 2. Acquire actors and create vLLM instance
-actors = pool.acquire(tp_size=4, pp_size=2)
+# Heterogeneous pool (assign dst ids):
+plan = src.migrate_kv_cache_to(dst, total_blocks=N, dst_occupied=occupied)
 
-llm = LLM(
-    model="facebook/opt-125m",
-    executor_class=ExternalExecutor,
-    external_actors=actors,
-    cache_manager=pool.cache_manager,
-)
+# RDMA peer-to-peer (tensors skip the driver):
+plan = src.migrate_kv_cache_to(dst, transport="mooncake_rdma")
+
+# Move requests, not just KV:
+dst.restore_requests(src.snapshot_requests(), block_mapping=plan.block_mapping)
 ```
 
-### Storage Backend Usage
-
-```python
-from vllm_external_executor import StorageCheckpointEngine
-
-# NFS backend
-engine = StorageCheckpointEngine(
-    backend="nfs",
-    config={"base_path": "/shared/checkpoints"},
-    device="cuda",
-)
-engine.set_checkpoint("opt-125m/step_1000")
-
-for name, tensor in engine.get_weights():
-    model.get_parameter(name).data.copy_(tensor)
-
-# Mooncake Store backend
-engine = StorageCheckpointEngine(
-    backend="mooncake",
-    config={
-        "metadata_server": "http://127.0.0.1:8080/metadata",
-        "master_server_address": "127.0.0.1:50051",
-        "protocol": "rdma",
-    },
-    device="cuda",
-)
-```
-
-## vLLM Core Changes
-
-Minimal parameter threading only (4 files):
-- `vllm/v1/engine/async_llm.py`: Add `external_actors` param
-- `vllm/v1/engine/core_client.py`: Thread parameter
-- `vllm/v1/engine/utils.py`: Thread parameter
-- `vllm/v1/engine/core.py`: Pass to executor
-
-No changes to vLLM's core logic.
-
-## Files
-
-```
-multi-task-infer/
-├── README.md                                    # Main documentation
-├── design.md                                    # 4+1 view design document
-├── STORAGE_CHECKPOINT_ENGINE_DESIGN.md          # Storage backend design
-├── STARTUP_DEPENDENCIES.md                      # Startup dependencies
-├── pyproject.toml                               # Plugin package config
-├── vllm_external_executor/                      # Plugin code
-│   ├── __init__.py                              # Module entry + plugin registration
-│   ├── external_worker_actor.py                 # Pre-started Ray Actor
-│   ├── actor_pool_manager.py                    # Actor pool manager
-│   ├── external_executor.py                     # ExternalExecutor implementation
-│   ├── cache_manager_actor.py                   # CacheManagerActor implementation
-│   └── storage_checkpoint_engine.py             # Storage backend checkpoint engine
-├── examples/
-│   ├── basic_usage.py                           # Usage examples
-│   └── mooncake_config.json                     # Mooncake config template
-├── tests/
-│   └── test_storage_checkpoint_engine.py        # Test cases
-└── verify_dependencies.sh                       # Dependency verification script
-```
+See `examples/kv_incremental_migration.py` for all five paths.
 
 ## Testing
 
+**What ran in this environment** (no `torch`/`vllm`/`ray`/`pytest`/`uv` —
+only the pure-logic modules are importable via `importlib`):
+
 ```bash
-# NFS backend test (no external dependencies)
-python tests/test_storage_checkpoint_engine.py nfs
+# 1. Syntax + import-surface check on every touched module:
+python3 -m py_compile \
+  vllm/v1/request.py vllm/v1/core/{kv_cache_manager,kv_cache_coordinator,block_pool}.py \
+  vllm/v1/engine/core.py \
+  multi-task-infer/vllm_external_executor/*.py multi-task-infer/tests/*.py
+# -> COMPILE OK
 
-# Mooncake mock test (no services needed)
-python tests/test_storage_checkpoint_engine.py mooncake_mock
-
-# Mooncake integration test (requires services)
-MOONCAKE_CONFIG_PATH=examples/mooncake_config.json \
-    python tests/test_storage_checkpoint_engine.py mooncake
-
-# Verify all dependencies
-bash verify_dependencies.sh
+# 2. Pure-logic regression (state machine, planner, scheduler, registry,
+#    transport key protocol + mocked-ray relay):
+# -> ALL LOGIC REGRESSION PASS
+#    KV TRANSPORT: 7 groups PASS
 ```
 
-## Dependencies
+**What must run on a full environment** (GPU + Ray + Mooncake for RDMA):
 
-### Core (required)
-- `vllm`
-- `ray[default]>=2.9`
-- `safetensors>=0.4.0`
+```bash
+cd multi-task-infer
+uv run --extra test pytest -q tests/test_global_scheduler.py \
+    tests/test_migration.py tests/test_kv_migration.py \
+    tests/test_kv_transport.py tests/test_node_registry.py
+uv run --extra test pytest -q tests/test_storage_checkpoint_engine.py -m "not mooncake"
+# RDMA (only on a Mooncake + IB cluster):
+uv run --extra test pytest -q tests/test_storage_checkpoint_engine.py -m mooncake
+```
 
-### Mooncake Store (optional)
-- `mooncake-transfer-engine`
-- `mooncake_master` service running
-- RDMA network (recommended) or TCP fallback
+## Model evaluation
 
-## Compatibility
+This PR adds orchestration/infrastructure only — it does not change weight
+loading math, sampling, or the scheduler's token accounting. The correctness
+property to verify on hardware is **migration fidelity**: engine A's output on
+a request migrated to engine B must be identical to running the request to
+completion on A. Pending hardware validation:
 
-- **verl**: `StorageCheckpointEngine` is compatible with verl's `CheckpointEngineWithCache` interface
-- **Hardware**: Supports both NVIDIA GPU (CUDA) and Ascend NPU
-- **Python**: 3.9+
+- [ ] Same-layout migration: migrated vs. uninterrupted decode are token-identical.
+- [ ] Heterogeneous remap: dst-id assignment never aliases an occupied block.
+- [ ] RDMA transport: Mooncake put/get round-trips tensors bit-exact.
+- [ ] Node kill: `recover_node` rebuilds the dead node's actors and re-routes.
 
-## Future Work
+## Known limitations
 
-- [ ] Mooncake batch API (`batch_put_from_multi_buffers`) for better throughput
-- [ ] Delta/incremental weight updates
-- [ ] Cache eviction policies
-- [ ] CacheManagerActor high availability
+- `MooncakeRdmaTransport` and `MooncakeStoreBackend` worker paths are
+  skeleton-verified offline only (CPU serialization + store put/get); RDMA
+  bandwidth / GPU-direct staging needs a Mooncake + IB cluster.
+- GPUDirect Storage (GDS) is not implemented — documented as a future
+  `StorageBackend` (requires `cufile` + GPUDirect storage).
+- CUDA Graph capture is not shared across models (documented; re-captured on
+  switch).
 
-## Checklist
+## Pre-submit checklist (maintainer must run)
 
-- [x] Code follows vLLM style guidelines (88 char line limit, Google-style docstrings)
-- [x] Tests included (NFS, Mooncake mock, Mooncake integration)
-- [x] Documentation complete (README, design docs, startup guide)
-- [x] Minimal vLLM core changes (parameter threading only)
-- [x] verl-compatible interface
-- [x] Supports both GPU and NPU
+- [ ] `gh pr list --repo vllm-project/vllm --state open --search "ExternalExecutor actor pool"`
+- [ ] `gh pr list --repo vllm-project/vllm --state open --search "KV cache migration"`
+- [ ] `pre-commit run --all-files` / `ruff` clean on the plugin directory.
+- [ ] Re-run the full-env test commands above and paste output.
+
+> **AI assistance**: generated with the assistance of an AI coding agent
+> (DeepSeek); the submitting human must review every changed line and run the
+> full-environment tests. All pure-logic modules were verified offline as
+> described in Testing.
