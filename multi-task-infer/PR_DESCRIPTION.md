@@ -1,7 +1,7 @@
 # [ExternalExecutor] Pre-started Ray actor pool, model hot-switching, and cross-node KV migration
 
 > PR description draft — copy into GitHub when opening the PR. Branch:
-> `feature/external-executor` (14 commits, `4ba3dc4eab..3f9a6356fe`).
+> `feature/external-executor` (19 commits, `4ba3dc4eab..88502482f0`).
 
 ## Summary
 
@@ -124,10 +124,12 @@ python3 -m py_compile \
   multi-task-infer/vllm_external_executor/*.py multi-task-infer/tests/*.py
 # -> COMPILE OK
 
-# 2. Pure-logic regression (state machine, planner, scheduler, registry,
-#    transport key protocol + mocked-ray relay, tiering/prefetch/index):
-# -> FULL REGRESSION: 6 modules PASS
-#    STORAGE ADVANCED: all modules PASS
+# 2. Pure-logic regression (state machine + compensation rollback, KV planner,
+#    transport factory + mocked-ray relay, scheduler, node registry heartbeat,
+#    tiering, prefix index, weight ledger, prefetch + orchestrator wiring):
+# -> FULL REGRESSION: all pure-logic modules PASS
+#    SWITCH_MODEL WIRING (phase_handlers + external sm): PASS
+#    KV MIGRATION SEMANTICS (prefetch + prefix index): PASS
 ```
 
 **What must run on a full environment** (GPU + Ray + Mooncake for RDMA):
