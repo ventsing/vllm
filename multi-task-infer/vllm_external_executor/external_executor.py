@@ -817,6 +817,81 @@ class ExternalExecutor(RayExecutorV2):
             block_id_to_hashes=block_id_to_hashes,
         )
 
+    def snapshot_requests(self) -> list[dict]:
+        """Export resident requests' state for cross-engine migration.
+
+        Returns one dict per resident request: serialized admission inputs
+        (``EngineCoreRequest``), the full token sequence, the delivered output
+        tokens, the KV compute position, and the per-group block ids covering
+        the computed tokens (the blocks that carry migrated KV).
+        """
+        if self._scheduler is None:
+            raise RuntimeError(
+                "scheduler not bound; this executor requires the EngineCore "
+                "bind_scheduler hook"
+            )
+        snapshots: list[dict] = []
+        for request in self._scheduler.requests.values():
+            block_ids = (
+                self._scheduler.kv_cache_manager.get_block_ids_for_computed_tokens(
+                    request.request_id, request.num_computed_tokens
+                )
+            )
+            snapshots.append(
+                {
+                    "engine_core_request": request.to_engine_core_request(),
+                    "all_token_ids": list(request.all_token_ids),
+                    "output_token_ids": list(request.output_token_ids),
+                    "num_computed_tokens": request.num_computed_tokens,
+                    "block_ids_by_group": [list(ids) for ids in block_ids],
+                }
+            )
+        return snapshots
+
+    def restore_requests(
+        self,
+        snapshots: list[dict],
+        block_mapping: dict[int, int] | None = None,
+    ) -> None:
+        """Rebuild migrated requests and mount their KV blocks on this executor.
+
+        For each snapshot: reconstruct the ``Request`` from its admission
+        inputs, restore the running state (full token sequence + compute
+        position), admit it to the scheduler, then attach the migrated KV
+        blocks via :meth:`import_request_blocks` (mapping source ids through
+        ``block_mapping`` for heterogeneous pools).
+
+        Args:
+            snapshots: List produced by :meth:`snapshot_requests`.
+            block_mapping: Optional ``src_block_id -> dst_block_id`` remap.
+        """
+        from vllm.v1.request import Request
+
+        if self._scheduler is None:
+            raise RuntimeError(
+                "scheduler not bound; this executor requires the EngineCore "
+                "bind_scheduler hook"
+            )
+        mapping = block_mapping or {}
+        for snap in snapshots:
+            request = Request.from_engine_core_request(
+                snap["engine_core_request"], block_hasher=None
+            )
+            request.restore_running_state(
+                snap["all_token_ids"],
+                snap["output_token_ids"],
+                snap["num_computed_tokens"],
+            )
+            self._scheduler.add_request(request)
+            block_ids_by_group = [
+                [mapping.get(bid, bid) for bid in group]
+                for group in snap["block_ids_by_group"]
+            ]
+            if any(block_ids_by_group):
+                self.import_request_blocks(
+                    request.request_id, block_ids_by_group
+                )
+
     def migrate_kv_cache_incremental(
         self,
         src_executor: "ExternalExecutor",
