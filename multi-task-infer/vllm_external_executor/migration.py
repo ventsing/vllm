@@ -163,6 +163,33 @@ class MigrationStateMachine:
         self._compensations: list[Compensation] = []
         self._rollback_done = False
         self._lock = threading.Lock()
+        self._on_enter: dict[MigrationPhase, list[Callable[[], None]]] = {}
+        self._on_exit: dict[MigrationPhase, list[Callable[[], None]]] = {}
+
+    # ---------------------------------------------------------------- hooks
+    def on_enter(self, phase: MigrationPhase, handler: Callable[[], None]) -> None:
+        """Register a callback fired after transitioning *into* ``phase``.
+
+        Hooks run outside the state lock, after the phase is committed. They
+        are the wiring point for decision-layer side effects (e.g. an async
+        prefetch kicked off on PREPARING). Handlers receive no arguments and
+        must not block on IO; long work should be dispatched asynchronously.
+        """
+        with self._lock:
+            self._on_enter.setdefault(phase, []).append(handler)
+
+    def on_exit(self, phase: MigrationPhase, handler: Callable[[], None]) -> None:
+        """Register a callback fired before transitioning *out of* ``phase``.
+
+        Fires after the next phase is validated but only when a transition
+        actually proceeds; failed transitions do not trigger exit hooks.
+        """
+        with self._lock:
+            self._on_exit.setdefault(phase, []).append(handler)
+
+    def _fire(self, handlers: list[Callable[[], None]]) -> None:
+        for handler in handlers:
+            handler()
 
     # ------------------------------------------------------------ transitions
     def transition(self, next_phase: MigrationPhase) -> None:
@@ -173,7 +200,12 @@ class MigrationStateMachine:
                     f"Illegal transition {self.phase.value} -> "
                     f"{next_phase.value}"
                 )
+            previous = self.phase
             self.phase = next_phase
+            exit_hooks = list(self._on_exit.get(previous, ()))
+            enter_hooks = list(self._on_enter.get(next_phase, ()))
+        self._fire(exit_hooks)
+        self._fire(enter_hooks)
 
     def register_compensation(self, handler: Compensation) -> None:
         """Register a rollback step for the phase just completed.

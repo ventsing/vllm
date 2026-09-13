@@ -143,6 +143,17 @@ class TieredCache:
         self, key: str, to_tier: StorageTier, now: float
     ) -> list[EvictionDecision]:
         """Move an entry to a warmer tier, evicting the target if it fills."""
+        return self._move(key, to_tier, now, reason="promotion")
+
+    def demote(
+        self, key: str, to_tier: StorageTier, now: float
+    ) -> list[EvictionDecision]:
+        """Move an entry to a colder tier, evicting the target if it fills."""
+        return self._move(key, to_tier, now, reason="eviction")
+
+    def _move(
+        self, key: str, to_tier: StorageTier, now: float, reason: str
+    ) -> list[EvictionDecision]:
         from_tier = self._by_key.get(key)
         if from_tier is None or from_tier == to_tier:
             return []
@@ -156,7 +167,7 @@ class TieredCache:
 
         decisions = self._evict_if_needed(to_tier, now)
         decisions.append(
-            EvictionDecision(key, from_tier, to_tier, reason="promotion")
+            EvictionDecision(key, from_tier, to_tier, reason=reason)
         )
         return decisions
 
@@ -183,6 +194,16 @@ class TieredCache:
             )
             self.put(victim.key, victim.size_bytes, colder, now)
         return decisions
+
+    def remove(self, key: str) -> int:
+        """Drop an entry wherever it resides; returns its size (0 if absent)."""
+        tier = self._by_key.get(key)
+        if tier is None:
+            return 0
+        entry = self._tiers[tier].entries.pop(key)
+        self._tiers[tier].usage -= entry.size_bytes
+        del self._by_key[key]
+        return entry.size_bytes
 
     def _remove(self, key: str, tier: StorageTier) -> None:
         entry = self._tiers[tier].entries.pop(key)

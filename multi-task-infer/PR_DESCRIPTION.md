@@ -23,7 +23,11 @@ Adds an `ExternalExecutor` plugin for vLLM V1 that:
 - Ships the **storage-base decision layer** for production deployment: a
   three-tier hierarchy (HBM/DRAM/REMOTE) with swap decisions, a
   cross-actor prefix index, a base+adapter weight-share ledger, and
-  access-heat prefetch ranking (pure-logic, unit-tested).
+  access-heat prefetch ranking (pure-logic, unit-tested). These are wired to
+  the migration state machine via `migration_orchestrator.py`: an async
+  prefetch hook (nominated at PREPARING, awaited at LOAD) and tiering-driven
+  checkpoint movement (CHECKPOINT→REMOTE, UNLOAD→DRAM, LOAD→HBM) with
+  compensation-based rollback of the decision bookkeeping.
 
 The plugin lives entirely under `multi-task-infer/` and hooks vLLM through the
 existing `vllm.general_plugins` entry point; core changes are intentionally
@@ -72,9 +76,10 @@ vllm_external_executor/
   global_prefix_index.py        # cross-actor prefix index, keyed by weight_hash (pure)
   weight_sharing.py             # base+adapter weight-share ledger + cost ratio (pure)
   prefetch_policy.py            # access heat + async prefetch decisions (pure)
+  migration_orchestrator.py     # decision layer -> state machine wiring
   cache_manager_actor.py        # compile-cache sharing (G6)
   storage_checkpoint_engine.py  # NFS / Mooncake backends (G7)
-tests/                          # 8 test modules (pytest, pure-logic where possible)
+tests/                          # 9 test modules (pytest, pure-logic where possible)
 examples/                       # basic usage + incremental migration/failover sketches
 design.md                       # full design doc (4+1 view)
 ```
@@ -157,9 +162,12 @@ completion on A. Pending hardware validation:
 - The five "advanced storage" capabilities ship as **pure-logic decision
   modules** with tests: `storage_tier` (tiering), `global_prefix_index`
   (cross-actor prefix reuse), `weight_sharing` (base+adapter ledger),
-  `prefetch_policy` (async prefetch ranking). Their execution side (moving
-  tensors across tiers, `switch_adapter`, background prefetch threads) is not
-  wired to the runtime and needs a GPU environment.
+  `prefetch_policy` (async prefetch ranking). `migration_orchestrator.py`
+  wires the tiering/prefetch decisions into the state machine (async prefetch
+  hook + tiered checkpoint movement + compensation rollback), but the
+  `start_prefetch`/`await_prefetch` callbacks are no-ops by default and the
+  physical `ship()`/tensor moves still need a GPU runtime to execute; the
+  decision layer is offline-tested.
 - Cross-model prefix sharing is valid only for identical `weight_hash`
   (same base + adapter); KV tensors are weight-dependent.
 - CUDA Graph capture is not shared across models (documented; re-captured on
