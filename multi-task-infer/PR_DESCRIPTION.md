@@ -18,7 +18,12 @@ Adds an `ExternalExecutor` plugin for vLLM V1 that:
 - Migrates a live engine's **KV cache incrementally** to another engine
   (prefix-cache aware; heterogeneous block-id remapping), restores in-flight
   requests, and moves KV tensors over a **pluggable transport**
-  (`ray_object_store` default, `mooncake_rdma` peer-to-peer optional).
+  (`ray_object_store` default, `mooncake_rdma` peer-to-peer, `cuda_ipc`
+  same-node zero-copy).
+- Ships the **storage-base decision layer** for production deployment: a
+  three-tier hierarchy (HBM/DRAM/REMOTE) with swap decisions, a
+  cross-actor prefix index, a base+adapter weight-share ledger, and
+  access-heat prefetch ranking (pure-logic, unit-tested).
 
 The plugin lives entirely under `multi-task-infer/` and hooks vLLM through the
 existing `vllm.general_plugins` entry point; core changes are intentionally
@@ -62,10 +67,14 @@ vllm_external_executor/
   node_registry_actor.py        # NodeRegistryActor: registration + heartbeat + dead detection
   migration.py                  # MigrationPhase state machine + atomic transactions
   kv_migration.py               # IncrementalKVPlanner (prefix-cache aware diff)
-  kv_transport.py               # KVTransport ABC + Ray/Mooncake backends + factory
+  kv_transport.py               # KVTransport ABC + Ray/Mooncake/CUDA-IPC backends + factory
+  storage_tier.py               # HBM/DRAM/REMOTE tiering + swap decisions (pure)
+  global_prefix_index.py        # cross-actor prefix index, keyed by weight_hash (pure)
+  weight_sharing.py             # base+adapter weight-share ledger + cost ratio (pure)
+  prefetch_policy.py            # access heat + async prefetch decisions (pure)
   cache_manager_actor.py        # compile-cache sharing (G6)
   storage_checkpoint_engine.py  # NFS / Mooncake backends (G7)
-tests/                          # 6 test modules (pytest, pure-logic where possible)
+tests/                          # 8 test modules (pytest, pure-logic where possible)
 examples/                       # basic usage + incremental migration/failover sketches
 design.md                       # full design doc (4+1 view)
 ```
@@ -106,9 +115,9 @@ python3 -m py_compile \
 # -> COMPILE OK
 
 # 2. Pure-logic regression (state machine, planner, scheduler, registry,
-#    transport key protocol + mocked-ray relay):
-# -> ALL LOGIC REGRESSION PASS
-#    KV TRANSPORT: 7 groups PASS
+#    transport key protocol + mocked-ray relay, tiering/prefetch/index):
+# -> FULL REGRESSION: 6 modules PASS
+#    STORAGE ADVANCED: all modules PASS
 ```
 
 **What must run on a full environment** (GPU + Ray + Mooncake for RDMA):
@@ -117,7 +126,8 @@ python3 -m py_compile \
 cd multi-task-infer
 uv run --extra test pytest -q tests/test_global_scheduler.py \
     tests/test_migration.py tests/test_kv_migration.py \
-    tests/test_kv_transport.py tests/test_node_registry.py
+    tests/test_kv_transport.py tests/test_node_registry.py \
+    tests/test_storage_tier.py tests/test_global_prefix_index.py
 uv run --extra test pytest -q tests/test_storage_checkpoint_engine.py -m "not mooncake"
 # RDMA (only on a Mooncake + IB cluster):
 uv run --extra test pytest -q tests/test_storage_checkpoint_engine.py -m mooncake
@@ -138,11 +148,20 @@ completion on A. Pending hardware validation:
 
 ## Known limitations
 
-- `MooncakeRdmaTransport` and `MooncakeStoreBackend` worker paths are
-  skeleton-verified offline only (CPU serialization + store put/get); RDMA
-  bandwidth / GPU-direct staging needs a Mooncake + IB cluster.
+- `MooncakeRdmaTransport`, `CudaIpcTransport` and `MooncakeStoreBackend`
+  worker paths are skeleton-verified offline only; RDMA bandwidth,
+  GPU-direct staging and `torch.from_ipc_handle` API compatibility need real
+  hardware (Mooncake + IB for RDMA; same-node GPU pair for CUDA IPC).
 - GPUDirect Storage (GDS) is not implemented — documented as a future
   `StorageBackend` (requires `cufile` + GPUDirect storage).
+- The five "advanced storage" capabilities ship as **pure-logic decision
+  modules** with tests: `storage_tier` (tiering), `global_prefix_index`
+  (cross-actor prefix reuse), `weight_sharing` (base+adapter ledger),
+  `prefetch_policy` (async prefetch ranking). Their execution side (moving
+  tensors across tiers, `switch_adapter`, background prefetch threads) is not
+  wired to the runtime and needs a GPU environment.
+- Cross-model prefix sharing is valid only for identical `weight_hash`
+  (same base + adapter); KV tensors are weight-dependent.
 - CUDA Graph capture is not shared across models (documented; re-captured on
   switch).
 
