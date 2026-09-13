@@ -451,22 +451,30 @@ class MigrationIdempotencyRegistry:
 class KVBlockRef:
     """KV 块元数据（活跃块/dirty/hash，元数据源是 EngineCore 的 KV cache manager）。"""
     block_id: int
-    content_hash: str = ""    # prefix cache key, 空串 = 无可哈希内容
+    content_hash: str = ""    # 该 group 的纯内容 hash(hex), 空串 = 无 hash
     version: int = 0          # 写入版本(无 hash 时的修改检测)
     token_count: int = 16
+    group_id: int = 0         # KV cache group; prefix 复用按 group 隔离
 
 @dataclass
 class KVMigrationPlan:
-    transfer: list[KVBlockRef]              # 需传输数据(新增/修改)
-    prefix_hits: list[tuple[int, int]]      # (src_id, dst_id) 复用, 零传输
-    unchanged: list[int]                    # 已存在, 跳过
+    transfer: list[KVBlockRef]              # 需传输数据(新增/修改, 按 block 去重搬)
+    prefix_hits: list[tuple[int, int, int]] # (src_id, dst_id, group_id) 零传输复用
+    unchanged: list[tuple[int, int]]        # (block_id, group_id) 已存在
+    block_mapping: dict[int, int]           # src_block_id -> dst_block_id(异规格)
 
 class IncrementalKVPlanner:
-    """纯逻辑增量 diff: 内容 hash 优先, version 兜底。"""
+    """纯逻辑增量 diff: 内容 hash 优先, version 兜底, group 隔离。"""
     def plan(self, src, dst) -> KVMigrationPlan: ...
-        # 同 id 同内容 -> unchanged; 同 id 异内容 -> transfer
-        # 新 id 但 hash 命中 dst(任意 id) -> prefix_hit(复用公共前缀, 零传输)
+        # 同 (group,id) 同内容 -> unchanged; 同 (group,id) 异内容 -> transfer
+        # 新 id 但 (group,hash) 命中 dst(任意 id) -> prefix_hit(零传输)
         # 其它 -> transfer
+    def assign_targets(self, plan, total_blocks, dst_occupied): ...
+        # 异规格: 为 transfer 的唯一 src block 分配空闲 dst id -> block_mapping
+
+class BlockIdAllocator:
+    """纯逻辑: 目标端空闲 block id 分配(异规格迁移)。"""
+    def allocate(self, num) -> list[int]: ...  # 升序分配空闲 id, 不足抛异常
 ```
 
 > 数据面：`ExternalWorkerActor.export_kv_blocks(block_ids)` /
@@ -1104,10 +1112,15 @@ class EngineCore:
 ```python
 # vllm/v1/core/block_pool.py
 class BlockPool:
-    def import_block_hashes(self, block_id_to_hash: dict) -> None:
-        """迁移数据面写完 KV tensor 后，重建 prefix-cache 索引（幂等）。"""
-        for block_id, block_hash in block_id_to_hash.items():
-            self._insert_block_hash(block_hash, self.blocks[block_id], num_tokens=None)
+    def import_block_hashes(self, block_id_to_hashes: dict) -> None:
+        """迁移数据面写完 KV tensor 后，重建 prefix-cache 索引（幂等）。
+
+        一个 block 可有多个 hash（每个 KV cache group 一个）。
+        """
+        for block_id, block_hashes in block_id_to_hashes.items():
+            block = self.blocks[block_id]
+            for block_hash in block_hashes:
+                self._insert_block_hash(block_hash, block, num_tokens=None)
 ```
 
 ## 3.4 新增文件清单
@@ -1568,26 +1581,32 @@ vLLM 核心修改（最小侵入，G5）：
 ```
   参与者: EngineCore(KV cache manager), ExternalExecutor, Worker(源/目标)
 
-  ① EngineCore 暂停调度 (set_scheduler_gate)，收集源端活跃块表 + content_hash
-  ② IncrementalKVPlanner.plan(src_blocks, dst_blocks) 计算增量 diff:
-       - unchanged:   同 block_id 且内容一致(hash 优先, version 兜底) → 跳过
-       - prefix_hits: 新 id 但 hash 命中目标任意 id → 复用公共前缀, 零传输
+  ① EngineCore 暂停调度 (set_scheduler_gate)
+  ② snapshot_kv_blocks(): 遍历 block_pool.blocks 按 (block_id, group) 导出:
+      每个 group 一条 KVBlockRef(block_id, content_hash=get_block_hash(h.hex()),
+      version=ref_cnt, group_id=get_group_id(h)) — hash 跨进程确定性, 可跨节点复用
+  ③ IncrementalKVPlanner.plan(src, dst) 计算 group-aware 增量 diff:
+       - unchanged:   同 (group,block_id) 且内容一致(hash 优先, version 兜底) → 跳过
+       - prefix_hits: 新 id 但 (group,hash) 命中目标任意 id → 复用公共前缀, 零传输
        - transfer:    新增/修改且无 hash 命中 → 需搬运数据
-  ③ ExternalExecutor.migrate_kv_cache_incremental():
-       仅对 plan.transfer 按 rank export_kv_blocks → import_kv_blocks
-  ④ import_prefix_cache(): 重建目标 block_pool 的 prefix-cache 索引
-  ⑤ 恢复调度 (resume)
+  ④ assign_targets(): 异规格迁移时给 transfer 的唯一 src block 分配空闲 dst id
+       (block_mapping: src_block_id -> dst_block_id); 同规格则 1:1 映射
+  ⑤ migrate_kv_cache_incremental(): 仅对 transfer 的 block 按 rank
+       export_kv_blocks → 重定向到 dst 块 → import_kv_blocks（数据面）
+  ⑥ import_prefix_cache(): 按 (dst_block_id, group_id, hash) 重建目标
+       block_pool 的 prefix-cache 索引（一个 block 多 group 各一条）
+  ⑦ 恢复调度 (resume)
 
-  效果: 长上下文续写/多轮对话只迁「增量 KV 块」，公共前缀复用已缓存块，
-        迁移成本从 O(num_blocks) 降到 O(新增+修改块)。
+  效果: 长上下文续写/多轮对话只迁「增量 KV 块」，公共前缀复用已缓存块（含
+        跨 group 隔离 + 跨节点/异规格映射），迁移成本 O(新增+修改块)。
 
   核心改动(2 处, 极小):
   1. vllm/v1/engine/core.py: scheduler 构造后若 executor 有 bind_scheduler
      钩子则调用 — 让插件拿到 scheduler(块表源真相), 默认 executor no-op。
-  2. vllm/v1/core/block_pool.py: 公开 BlockPool.import_block_hashes()
-     — 数据面写完 KV tensor 后重建 prefix-cache 索引(幂等)。
+  2. vllm/v1/core/block_pool.py: 公开 BlockPool.import_block_hashes() 支持
+     一个 block 多 group hash — 数据面写完 KV tensor 后重建 prefix 索引(幂等)。
   其余全在插件 vllm_external_executor/: bind_scheduler / snapshot_kv_blocks /
-  import_prefix_cache / migrate_kv_cache_to (端到端编排)。
+  import_prefix_cache / migrate_kv_cache_to(端到端编排, 支持异规格 remap)。
 ```
 
 ## 5.4 场景 4：弹性伸缩（TP/PP 变化）
