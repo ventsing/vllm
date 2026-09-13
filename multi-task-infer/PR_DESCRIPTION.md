@@ -158,6 +158,10 @@ completion on A. Pending hardware validation:
 - [ ] RDMA transport: Mooncake put/get round-trips tensors bit-exact.
 - [ ] Node kill: `recover_node` rebuilds the dead node's actors and re-routes.
 
+The full per-item hardware checklist (environment, commands, pass criteria,
+and a summary checkbox table for M1–M10) lives in
+`multi-task-infer/HARDWARE_VALIDATION.md`.
+
 ## Known limitations
 
 - `MooncakeRdmaTransport`, `CudaIpcTransport` and `MooncakeStoreBackend`
