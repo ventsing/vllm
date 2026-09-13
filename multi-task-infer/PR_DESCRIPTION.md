@@ -25,12 +25,14 @@ Adds an `ExternalExecutor` plugin for vLLM V1 that:
   cross-actor prefix index, a base+adapter weight-share ledger, and
   access-heat prefetch ranking (pure-logic, unit-tested). These are wired to
   the migration state machine via `migration_orchestrator.py` and consumed by
-  `ExternalExecutor`: `migrate_kv_cache_to(prefetch=...)` drives the async
-  prefetch hook (hot, non-resident prefixes nominated at PREPARING and awaited
-  at LOAD) and registers transferred prefixes on the shared
-  `GlobalPrefixIndex`; the state machine also emits tiering-driven checkpoint
-  movement (CHECKPOINT→REMOTE, UNLOAD→DRAM, LOAD→HBM) with compensation-based
-  rollback of its own bookkeeping.
+  both `ExternalExecutor` migration paths: `switch_model` injects per-phase
+  execution callbacks (pause / checkpoint / switch / restore) through
+  `phase_handlers` and consumes the tiering script + `WeightShareLedger`
+  bookkeeping (base+adapter); `migrate_kv_cache_to(prefetch=...)` drives the
+  async prefetch hook (hot, non-resident prefixes nominated at PREPARING and
+  awaited at LOAD) and registers transferred prefixes on the shared
+  `GlobalPrefixIndex`. Both paths get compensation-based rollback of their own
+  bookkeeping.
 
 The plugin lives entirely under `multi-task-infer/` and hooks vLLM through the
 existing `vllm.general_plugins` entry point; core changes are intentionally

@@ -215,5 +215,67 @@ def test_kv_migration_semantics_prefetch_and_index():
     assert sm.phase.value == "completed"
 
 
+def test_phase_handlers_and_external_sm():
+    """Phase handlers fire in order on an externally-owned state machine.
+
+    Mirrors ``switch_model``: the executor pre-creates the machine inside
+    ``MigrationIdempotencyRegistry``, passes it via ``sm=``, and injects
+    per-phase execution callbacks (pause / checkpoint / switch / restore).
+    """
+    spec = MigrationSpec(
+        target="m",
+        source_checkpoint="cur",
+        payload={
+            "target_checkpoint": "tgt",
+            "checkpoint_bytes": 0,
+            "base_bytes": 0,
+            "base_hash": "wA",
+        },
+    )
+    external_sm = migration.MigrationStateMachine(spec)
+    seen = []
+
+    def phase_handler(phase):
+        def handler(sm, script):
+            seen.append((phase, sm is external_sm, script.migration_id))
+
+        return handler
+
+    handlers = {
+        phase: phase_handler(phase)
+        for phase in [
+            migration.MigrationPhase.PREPARING,
+            migration.MigrationPhase.GRACEFUL_PAUSE,
+            migration.MigrationPhase.CHECKPOINT,
+            migration.MigrationPhase.UNLOAD,
+            migration.MigrationPhase.LOAD,
+            migration.MigrationPhase.RESTORE,
+        ]
+    }
+
+    orchestrator = _build(spec)
+    sm, script = orchestrator.migrate(
+        spec, actor_id="a0",
+        candidates={}, resident=set(),
+        phase_handlers=handlers, sm=external_sm,
+    )
+
+    assert sm is external_sm
+    assert [p for p, _, _ in seen] == [
+        migration.MigrationPhase.PREPARING,
+        migration.MigrationPhase.GRACEFUL_PAUSE,
+        migration.MigrationPhase.CHECKPOINT,
+        migration.MigrationPhase.UNLOAD,
+        migration.MigrationPhase.LOAD,
+        migration.MigrationPhase.RESTORE,
+    ]
+    assert all(flag for _, flag, _ in seen)
+    # switch_model payload has base_hash but no prefix entries: the ledger is
+    # updated, the prefix index is not.
+    assert script.weight_register == [("a0", "wA", None)]
+    assert script.prefix_register == []
+    assert external_sm.phase == migration.MigrationPhase.COMPLETED
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
