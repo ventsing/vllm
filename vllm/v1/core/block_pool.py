@@ -639,7 +639,7 @@ class BlockPool:
 
     def import_block_hashes(
         self,
-        block_id_to_hash: dict[int, BlockHashWithGroupId],
+        block_id_to_hashes: dict[int, Iterable[BlockHashWithGroupId]],
     ) -> None:
         """Register externally-written blocks into the prefix-cache index.
 
@@ -649,10 +649,13 @@ class BlockPool:
         those blocks. Idempotent for already-registered hashes.
 
         Args:
-            block_id_to_hash: Maps physical block id to its ``BlockHashWithGroupId``.
+            block_id_to_hashes: Maps physical block id to its prefix-cache
+                hashes (one or more, one per KV cache group).
         """
-        for block_id, block_hash in block_id_to_hash.items():
-            self._insert_block_hash(block_hash, self.blocks[block_id], num_tokens=None)
+        for block_id, block_hashes in block_id_to_hashes.items():
+            block = self.blocks[block_id]
+            for block_hash in block_hashes:
+                self._insert_block_hash(block_hash, block, num_tokens=None)
 
     def move_block_hashes(
         self,

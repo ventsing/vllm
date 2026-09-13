@@ -693,17 +693,21 @@ class ExternalExecutor(RayExecutorV2):
         self._scheduler = scheduler
 
     def snapshot_kv_blocks(self) -> list:
-        """Export live KV blocks as ``KVBlockRef`` metadata.
+        """Export live KV blocks as group-aware ``KVBlockRef`` metadata.
 
-        Walks the scheduler's block pool and returns one ref per block that is
-        either referenced by a request (``ref_cnt > 0``) or resident in the
-        prefix cache (``block_hash`` set). The content hash is the block's
-        ``BlockHashWithGroupId`` hex, stable across processes thanks to
-        vLLM's deterministic prefix hashing.
+        Walks the scheduler's block pool and returns one ref per
+        ``(block_id, kv_cache_group)`` that is either referenced by a request
+        (``ref_cnt > 0``) or resident in the prefix cache. A block may appear
+        once per group (multi-group models: encoder/decoder, full/sliding
+        window). The content hash is the group's *pure* content hash (hex,
+        group id stripped), stable across processes thanks to vLLM's
+        deterministic prefix hashing.
 
         Returns:
             ``KVBlockRef`` list suitable for :class:`IncrementalKVPlanner`.
         """
+        from vllm.v1.core.kv_cache_utils import get_block_hash, get_group_id
+
         from vllm_external_executor.kv_migration import KVBlockRef
 
         if self._scheduler is None:
@@ -712,62 +716,81 @@ class ExternalExecutor(RayExecutorV2):
                 "bind_scheduler hook"
             )
         block_pool = self._scheduler.kv_cache_manager.block_pool
-        refs = []
+        refs: list[KVBlockRef] = []
         for block in block_pool.blocks:
-            if block.ref_cnt <= 0 and block.block_hash is None:
-                continue
-            refs.append(
-                KVBlockRef(
-                    block_id=block.block_id,
-                    content_hash=(
-                        block.block_hash.hex()
-                        if block.block_hash is not None
-                        else ""
-                    ),
-                    version=block.ref_cnt,
-                )
+            hashes: set = set()
+            if block.block_hash is not None:
+                hashes.add(block.block_hash)
+            hashes.update(
+                block_pool.cached_block_hashes_by_block.get(block.block_id, ())
             )
+            if hashes:
+                for block_hash in sorted(hashes):
+                    refs.append(
+                        KVBlockRef(
+                            block_id=block.block_id,
+                            content_hash=get_block_hash(block_hash).hex(),
+                            version=block.ref_cnt,
+                            group_id=get_group_id(block_hash),
+                        )
+                    )
+            elif block.ref_cnt > 0:
+                # Live but unhashed (mid-fill / caching off): still migrate,
+                # but no group/prefix signal; group 0 is a placeholder.
+                refs.append(
+                    KVBlockRef(
+                        block_id=block.block_id,
+                        version=block.ref_cnt,
+                    )
+                )
         return refs
 
     def import_prefix_cache(
         self,
-        block_id_to_hash: dict[int, str | bytes],
+        block_group_hashes: list[tuple[int, int, str]],
     ) -> int:
         """Restore the prefix-cache index after an incremental KV import.
 
         After the data plane copies KV tensors into the destination workers,
         the scheduler-side prefix cache is still stale. This re-registers the
-        imported blocks' hashes so subsequent requests hit them. Accepts hex
-        strings (as produced by :meth:`snapshot_kv_blocks`) or raw bytes
-        (``BlockHashWithGroupId``).
+        imported blocks' hashes (one per group) so subsequent requests hit
+        them.
 
         Args:
-            block_id_to_hash: Destination block id -> content hash.
+            block_group_hashes: ``(dst_block_id, group_id, content_hash_hex)``
+                triples produced by :meth:`snapshot_kv_blocks` / the planner.
 
         Returns:
             Number of hashes registered.
         """
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash,
+            make_block_hash_with_group_id,
+        )
+
         if self._scheduler is None:
             raise RuntimeError(
                 "scheduler not bound; this executor requires the EngineCore "
                 "bind_scheduler hook"
             )
-        converted = {
-            block_id: (
-                hash_value
-                if isinstance(hash_value, bytes)
-                else bytes.fromhex(hash_value)
+        by_block: dict[int, list] = {}
+        for block_id, group_id, content_hash in block_group_hashes:
+            if not content_hash:
+                continue
+            by_block.setdefault(block_id, []).append(
+                make_block_hash_with_group_id(
+                    BlockHash(bytes.fromhex(content_hash)), group_id
+                )
             )
-            for block_id, hash_value in block_id_to_hash.items()
-        }
-        self._scheduler.kv_cache_manager.block_pool.import_block_hashes(converted)
-        return len(converted)
+        self._scheduler.kv_cache_manager.block_pool.import_block_hashes(by_block)
+        return len(by_block)
 
     def migrate_kv_cache_incremental(
         self,
         src_executor: "ExternalExecutor",
         src_blocks: list,
         dst_blocks: list,
+        block_mapping: dict[int, int] | None = None,
     ):
         """
         Ship only the KV blocks that actually changed to this executor.
@@ -783,6 +806,8 @@ class ExternalExecutor(RayExecutorV2):
             src_executor: Source executor whose workers hold the live KV cache.
             src_blocks: Source ``KVBlockRef`` metadata (live blocks).
             dst_blocks: Destination ``KVBlockRef`` metadata (resident blocks).
+            block_mapping: Optional ``src_block_id -> dst_block_id`` map for
+                heterogeneous pools. When ``None``, ids map 1:1 (same-layout).
 
         Returns:
             The computed :class:`KVMigrationPlan` (transfer / prefix_hits /
@@ -803,14 +828,23 @@ class ExternalExecutor(RayExecutorV2):
         logger.info("Incremental KV migration: %s", plan.summary())
 
         if plan.transfer:
-            block_ids = [b.block_id for b in plan.transfer]
+            src_ids = sorted({b.block_id for b in plan.transfer})
             exported = ray.get(
                 [
-                    h.actor.export_kv_blocks.remote(block_ids)
+                    h.actor.export_kv_blocks.remote(src_ids)
                     for h in src_executor.ray_worker_handles
                 ],
                 timeout=_MIGRATION_RPC_TIMEOUT,
             )
+            # Redirect each payload to its destination block id.
+            for payloads in exported:
+                for payload in payloads:
+                    sid = payload["block_id"]
+                    payload["block_id"] = (
+                        block_mapping.get(sid, sid)
+                        if block_mapping is not None
+                        else sid
+                    )
             ray.get(
                 [
                     dh.actor.import_kv_blocks.remote(payloads)
@@ -822,7 +856,7 @@ class ExternalExecutor(RayExecutorV2):
             )
             logger.info(
                 "Transferred %d KV blocks (rank-for-rank)",
-                len(block_ids),
+                len(src_ids),
             )
 
         return plan
@@ -830,35 +864,62 @@ class ExternalExecutor(RayExecutorV2):
     def migrate_kv_cache_to(
         self,
         target_executor: "ExternalExecutor",
+        total_blocks: int | None = None,
+        dst_occupied: list[int] | None = None,
     ):
         """
         End-to-end incremental KV migration from this executor to another.
 
-        Assumes a same-model, same-layout migration (e.g. cross-node actor
-        migration): physical block ids correspond 1:1 across executors. Flows
-        through snapshot -> diff -> data-plane copy -> prefix-cache restore.
+        Flows through snapshot -> diff -> (optional) target-id assignment ->
+        data-plane copy -> prefix-cache restore. When ``total_blocks`` is
+        provided, source block ids are remapped onto free destination ids
+        (heterogeneous pools); otherwise ids map 1:1 (same-layout).
 
         Args:
             target_executor: Destination executor (empty or partially-populated
                 KV cache).
+            total_blocks: Destination pool size. Provide to enable
+                heterogeneous block-id remapping.
+            dst_occupied: Destination block ids already in use (when remapping).
 
         Returns:
             The computed :class:`KVMigrationPlan`.
         """
+        from vllm_external_executor.kv_migration import IncrementalKVPlanner
+
         src_blocks = self.snapshot_kv_blocks()
         dst_blocks = target_executor.snapshot_kv_blocks()
-        plan = target_executor.migrate_kv_cache_incremental(
-            self, src_blocks, dst_blocks
+        plan = IncrementalKVPlanner().plan(src_blocks, dst_blocks)
+
+        if total_blocks is not None:
+            IncrementalKVPlanner().assign_targets(
+                plan,
+                total_blocks=total_blocks,
+                dst_occupied=dst_occupied or (),
+            )
+
+        target_executor.migrate_kv_cache_incremental(
+            self,
+            src_blocks,
+            dst_blocks,
+            block_mapping=plan.block_mapping or None,
         )
 
         if plan.transfer:
-            block_id_to_hash = {
-                b.block_id: b.content_hash
-                for b in plan.transfer
-                if b.content_hash
-            }
-            if block_id_to_hash:
-                imported = target_executor.import_prefix_cache(block_id_to_hash)
+            # Register transferred blocks' hashes on the target, using the
+            # remapped destination ids when present.
+            block_group_hashes = []
+            for b in plan.transfer:
+                if not b.content_hash:
+                    continue
+                dst_id = plan.block_mapping.get(b.block_id, b.block_id)
+                block_group_hashes.append(
+                    (dst_id, b.group_id, b.content_hash)
+                )
+            if block_group_hashes:
+                imported = target_executor.import_prefix_cache(
+                    block_group_hashes
+                )
                 logger.info(
                     "Restored prefix-cache index for %d blocks", imported
                 )
