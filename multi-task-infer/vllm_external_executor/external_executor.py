@@ -898,6 +898,7 @@ class ExternalExecutor(RayExecutorV2):
         src_blocks: list,
         dst_blocks: list,
         block_mapping: dict[int, int] | None = None,
+        transport: str | None = None,
     ):
         """
         Ship only the KV blocks that actually changed to this executor.
@@ -915,14 +916,16 @@ class ExternalExecutor(RayExecutorV2):
             dst_blocks: Destination ``KVBlockRef`` metadata (resident blocks).
             block_mapping: Optional ``src_block_id -> dst_block_id`` map for
                 heterogeneous pools. When ``None``, ids map 1:1 (same-layout).
+            transport: KV transport backend name
+                (``ray_object_store`` or ``mooncake_rdma``). Defaults to
+                Ray Object Store (TCP relay).
 
         Returns:
             The computed :class:`KVMigrationPlan` (transfer / prefix_hits /
             unchanged), so EngineCore can remap the destination block table.
         """
-        import ray
-
         from vllm_external_executor.kv_migration import IncrementalKVPlanner
+        from vllm_external_executor.kv_transport import KVTransportFactory
 
         if len(src_executor.ray_worker_handles) != len(self.ray_worker_handles):
             raise ValueError(
@@ -936,34 +939,19 @@ class ExternalExecutor(RayExecutorV2):
 
         if plan.transfer:
             src_ids = sorted({b.block_id for b in plan.transfer})
-            exported = ray.get(
-                [
-                    h.actor.export_kv_blocks.remote(src_ids)
-                    for h in src_executor.ray_worker_handles
-                ],
-                timeout=_MIGRATION_RPC_TIMEOUT,
+            selected = KVTransportFactory.create(
+                transport or "ray_object_store"
             )
-            # Redirect each payload to its destination block id.
-            for payloads in exported:
-                for payload in payloads:
-                    sid = payload["block_id"]
-                    payload["block_id"] = (
-                        block_mapping.get(sid, sid)
-                        if block_mapping is not None
-                        else sid
-                    )
-            ray.get(
-                [
-                    dh.actor.import_kv_blocks.remote(payloads)
-                    for dh, payloads in zip(
-                        self.ray_worker_handles, exported
-                    )
-                ],
+            shipped = selected.ship(
+                src_executor,
+                self,
+                src_ids,
+                block_mapping=block_mapping,
                 timeout=_MIGRATION_RPC_TIMEOUT,
             )
             logger.info(
-                "Transferred %d KV blocks (rank-for-rank)",
-                len(src_ids),
+                "Transferred %d KV blocks via %s (rank-for-rank)",
+                shipped, selected.name,
             )
 
         return plan
@@ -973,6 +961,7 @@ class ExternalExecutor(RayExecutorV2):
         target_executor: "ExternalExecutor",
         total_blocks: int | None = None,
         dst_occupied: list[int] | None = None,
+        transport: str | None = None,
     ):
         """
         End-to-end incremental KV migration from this executor to another.
@@ -988,6 +977,8 @@ class ExternalExecutor(RayExecutorV2):
             total_blocks: Destination pool size. Provide to enable
                 heterogeneous block-id remapping.
             dst_occupied: Destination block ids already in use (when remapping).
+            transport: KV transport backend name passed through to the data
+                plane (``ray_object_store`` or ``mooncake_rdma``).
 
         Returns:
             The computed :class:`KVMigrationPlan`.
@@ -1010,6 +1001,7 @@ class ExternalExecutor(RayExecutorV2):
             src_blocks,
             dst_blocks,
             block_mapping=plan.block_mapping or None,
+            transport=transport,
         )
 
         if plan.transfer:

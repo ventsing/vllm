@@ -96,6 +96,10 @@ class ExternalWorkerActor:
         self._active_checkpoint_path: str | None = None
         self._active_storage_backend: str = "nfs"
         self._active_storage_config: dict | None = None
+
+        # Mooncake store handle for the RDMA KV transport (lazy init).
+        self._mooncake_store = None
+        self._mooncake_store_config: dict | None = None
         
         # Message queues (set during initialize_worker)
         self.rpc_broadcast_mq = None
@@ -632,7 +636,133 @@ class ExternalWorkerActor:
                 caches[gidx][block_id].copy_(tensor)
             count += 1
         return count
-    
+
+    # -------------------------------------------- RDMA KV transport (Mooncake)
+    def configure_kv_transport(self, store_config: dict | None) -> None:
+        """Set the Mooncake store config used by the RDMA KV transport.
+
+        The store itself is created lazily on the first export/import so that
+        workers without Mooncake installed never pay the import cost until the
+        RDMA transport is actually selected.
+        """
+        self._mooncake_store_config = store_config or {}
+
+    def _get_mooncake_store(self):
+        """Return a lazily-initialized Mooncake store handle.
+
+        Raises:
+            RuntimeError: If the store cannot be initialized (Mooncake not
+                installed or the config is invalid).
+        """
+        if self._mooncake_store is not None:
+            return self._mooncake_store
+        try:
+            from mooncake.store import MooncakeDistributedStore
+        except ImportError:
+            try:
+                from mooncake import MooncakeDistributedStore
+            except ImportError as e:
+                raise RuntimeError(
+                    "Mooncake is not installed; cannot use the RDMA KV "
+                    "transport. Install mooncake-transfer-engine or select "
+                    "transport='ray_object_store'."
+                ) from e
+
+        import socket
+
+        config = self._mooncake_store_config or {}
+        metadata_server = config.get(
+            "metadata_server", "http://127.0.0.1:8080/metadata"
+        )
+        master = config.get("master_server_address", "127.0.0.1:50051")
+        protocol = config.get("protocol", "tcp")
+        device_name = config.get("device_name", "")
+        segment_size = config.get("global_segment_size", 512 * 1024 * 1024)
+        local_buffer = config.get("local_buffer_size", 64 * 1024 * 1024)
+
+        store = MooncakeDistributedStore()
+        ret = store.setup(
+            config.get("hostname", socket.gethostname()),
+            metadata_server,
+            segment_size,
+            local_buffer,
+            protocol,
+            device_name,
+            master,
+        )
+        if ret not in (0, None, True):
+            raise RuntimeError(f"Mooncake store setup failed: {ret}")
+        self._mooncake_store = store
+        return store
+
+    def export_kv_blocks_to_store(
+        self, block_ids: list[int]
+    ) -> list[dict]:
+        """Export KV blocks and stage them in the Mooncake store.
+
+        Each block payload is serialized (the group shards included) and
+        ``put`` under a fresh key; only the key (plus the source block id) is
+        returned, so the driver forwards metadata instead of tensors.
+
+        Returns:
+            List of ``KVBlockKey``-shaped dicts (``store_key``, ``block_id``,
+            ``num_groups``).
+        """
+        import io
+        import uuid
+
+        payloads = self.export_kv_blocks(block_ids)
+        store = self._get_mooncake_store()
+        keys = []
+        for payload in payloads:
+            buf = io.BytesIO()
+            torch.save(payload, buf)
+            store_key = f"kvblock:{uuid.uuid4().hex}"
+            store.put(store_key, buf.getvalue())
+            keys.append(
+                {
+                    "store_key": store_key,
+                    "block_id": payload["block_id"],
+                    "num_groups": len(payload["shards"]),
+                }
+            )
+        return keys
+
+    def import_kv_blocks_from_store(
+        self,
+        keys: list[dict],
+        block_mapping: dict[int, int] | None = None,
+    ) -> int:
+        """Pull staged KV blocks from the Mooncake store and import them.
+
+        Args:
+            keys: ``KVBlockKey``-shaped dicts produced by
+                :meth:`export_kv_blocks_to_store`.
+            block_mapping: Optional ``src_block_id -> dst_block_id`` remap.
+
+        Returns:
+            Number of blocks imported.
+        """
+        import io
+
+        store = self._get_mooncake_store()
+        caches = self._get_kv_caches()
+        count = 0
+        for key in keys:
+            raw = store.get(key["store_key"])
+            if not raw:
+                raise FileNotFoundError(
+                    f"KV block not found in store: {key['store_key']}"
+                )
+            payload = torch.load(io.BytesIO(raw), map_location="cpu")
+            dst_id = (block_mapping or {}).get(
+                key["block_id"], key["block_id"]
+            )
+            for gidx, tensor in payload["shards"].items():
+                caches[gidx][dst_id].copy_(tensor)
+            count += 1
+        return count
+
     def _get_kv_caches(self):
         """Return this worker's KV cache tensors (one per cache group).
 
