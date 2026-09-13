@@ -1,7 +1,7 @@
 # [ExternalExecutor] Pre-started Ray actor pool, model hot-switching, and cross-node KV migration
 
 > PR description draft — copy into GitHub when opening the PR. Branch:
-> `feature/external-executor` (19 commits, `4ba3dc4eab..88502482f0`).
+> `feature/external-executor` (pushed to the `ventsing/vllm` fork).
 
 ## Summary
 
