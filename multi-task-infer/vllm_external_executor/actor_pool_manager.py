@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 RPC_TIMEOUT = 30.0
 DEFAULT_HEARTBEAT_INTERVAL = 5.0
 DEFAULT_HEARTBEAT_TIMEOUT = 30.0
+# Node-level liveness is more forgiving than actor-level: a single actor may
+# flap, but a node is only declared dead when its *node* heartbeat stalls.
+DEFAULT_NODE_HEARTBEAT_TIMEOUT = 60.0
 MAX_HEARTBEAT_FAILURES = 3
 
 
@@ -90,6 +93,7 @@ class ActorPoolManager:
         self._hb_failures: dict[int, int] = {}       # pool index -> failures
         self.heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
         self.heartbeat_timeout = DEFAULT_HEARTBEAT_TIMEOUT
+        self.node_heartbeat_timeout = DEFAULT_NODE_HEARTBEAT_TIMEOUT
 
         # Active leases: lease_id -> [actor_id] (for future accounting).
         self._leases: dict[str, list[str]] = {}
@@ -112,6 +116,7 @@ class ActorPoolManager:
         strategy: str = "pack",
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT,
+        node_heartbeat_timeout: float = DEFAULT_NODE_HEARTBEAT_TIMEOUT,
     ) -> None:
         """
         Pre-start actors and bind them to GPU/NPU devices.
@@ -132,7 +137,9 @@ class ActorPoolManager:
                 Defaults to the node id, so each node is its own fault domain.
             strategy: Placement group strategy ("pack" or "spread").
             heartbeat_interval: Seconds between heartbeat rounds.
-            heartbeat_timeout: Seconds before an actor/node is considered dead.
+            heartbeat_timeout: Seconds before an actor is considered dead.
+            node_heartbeat_timeout: Seconds before a whole node is considered
+                dead (auto-triggers :meth:`recover_node`).
         """
         import ray
         from ray.runtime_env import RuntimeEnv
@@ -150,6 +157,7 @@ class ActorPoolManager:
 
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_timeout = heartbeat_timeout
+        self.node_heartbeat_timeout = node_heartbeat_timeout
         self.fault_domain = fault_domain
 
         logger.info(
@@ -718,7 +726,7 @@ class ActorPoolManager:
         self._hb_thread.start()
 
     def _heartbeat_loop(self) -> None:
-        """Periodically probe each actor and register liveness."""
+        """Periodically probe actors/nodes and register liveness."""
         import ray
 
         while not self._hb_stop.is_set():
@@ -729,6 +737,33 @@ class ActorPoolManager:
             self._hb_stop.wait(self.heartbeat_interval)
 
     def _heartbeat_round(self, ray) -> None:
+        # Node-level first: refresh node liveness, auto-recover dead nodes.
+        # recover_node rebuilds the dead node's actors in place, so the
+        # actor-level pass below then probes the replacement handles and does
+        # not double-rebuild them.
+        if self.registry is not None:
+            self._heartbeat_nodes_and_recover(ray)
+        self._heartbeat_actors(ray)
+
+    def _heartbeat_nodes_and_recover(self, ray) -> None:
+        """Refresh node heartbeats and auto-recover stalled nodes."""
+        for node_id in self.node_mapping:
+            ray.get(
+                self.registry.node_heartbeat.remote(node_id),
+                timeout=self.heartbeat_timeout,
+            )
+        dead_nodes = ray.get(
+            self.registry.detect_dead_nodes.remote(self.node_heartbeat_timeout),
+            timeout=self.heartbeat_timeout,
+        )
+        for node_id in dead_nodes:
+            logger.warning(
+                "Node %s heartbeat stale (>%ss); auto-recovering its actors",
+                node_id, self.node_heartbeat_timeout,
+            )
+            self.recover_node(node_id)
+
+    def _heartbeat_actors(self, ray) -> None:
         for idx, actor in enumerate(self.actors):
             actor_id = self.actor_ids.get(idx)
             try:

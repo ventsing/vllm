@@ -256,6 +256,14 @@ class ActorPoolManager:
     
     def rebuild_actor(self, actor_id: str, target_node_id: str | None = None):
         """跨节点迁移：在健康节点等价重建（GPU Actor 无法 live-migrate）"""
+
+    # 心跳后台线程（_heartbeat_loop）：每次心跳轮先节点级、后 Actor 级
+    def _heartbeat_nodes_and_recover(self, ray) -> None:
+        """发节点心跳 → detect_dead_nodes → 对死节点自动 recover_node。
+
+        节点级超时（默认 60s）宽于 Actor 级（默认 30s），先于 Actor 级执行，
+        从而一次重建整节点，避免对同一批 Actor 重复 rebuild。
+        """
 ```
 
 ### 1.3.2 ExternalExecutor 接口
@@ -1936,6 +1944,8 @@ vLLM 核心修改（最小侵入，G5）：
 | **KV Cache 大小变化** | 不同模型/并行策略可能需要不同大小的 KV Cache | 每次重新分配 KV Cache |
 | **分布式环境重建** | TP/PP 大小变化时需要重新初始化 NCCL/HCCl | 允许重新初始化，NPU 侧已预热所以很快 |
 | **switch_model 时序** | 热切换 (G3) 需要调用方保证无 in-flight 请求 | executor 层负责模型重建 + 存储加载 + KV cache 重分配 (已实现) |
+| **KV 数据面走 Ray TCP** | `export/import_kv_blocks` 经 Ray Object Store 跨节点传输，非 RDMA | 大 KV 迁移走 RDMA（Mooncake 已有权重后端，KV 侧可复用其 store 接口，待真机验证） |
+| **GDS 未实现** | GPUDirect Storage（GPU↔NVMe 直通）无后端，NFS 是 CPU 路径、Mooncake 是 RDMA 内存 | 需 cufile + GPUDirect 存储，作为 `StorageBackend` 新后端预留（硬件依赖，暂不落地） |
 | **编译等待硬编码** | 编译锁等待用 time.sleep(5) 轮询 | 改为事件通知/等待机制 |
 
 ---
