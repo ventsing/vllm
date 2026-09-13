@@ -1218,7 +1218,11 @@ class Request:
 | `vllm_external_executor/node_registry_actor.py` | NodeRegistryActor：注册/心跳/统一视图/死检测 | ~279 |
 | `vllm_external_executor/migration.py` | 迁移状态机 + 原子事务 + 幂等 + FlightBatchPolicy | ~313 |
 | `vllm_external_executor/kv_migration.py` | KV 块增量迁移规划 + Prefix Caching 感知 | ~138 |
-| `vllm_external_executor/kv_transport.py` | KV 数据面传输后端（Ray TCP / Mooncake RDMA）+ 工厂 | ~180 |
+| `vllm_external_executor/kv_transport.py` | KV 数据面传输后端（Ray TCP / Mooncake RDMA / CUDA IPC）+ 工厂 | ~250 |
+| `vllm_external_executor/storage_tier.py` | 三级分层存储（HBM/DRAM/REMOTE）+ 换入换出决策（纯逻辑） | ~190 |
+| `vllm_external_executor/global_prefix_index.py` | 跨 Actor 全局前缀哈希索引（同权重可复用，纯逻辑） | ~130 |
+| `vllm_external_executor/weight_sharing.py` | base+adapter 权重共享记账 + 迁移成本量化（纯逻辑） | ~100 |
+| `vllm_external_executor/prefetch_policy.py` | 访问热度追踪 + 异步预取决策（纯逻辑） | ~110 |
 | `vllm_external_executor/cache_manager_actor.py` | CacheManagerActor 实现（G6） | ~474 |
 | `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~884 |
 | `examples/basic_usage.py` | 使用示例 | ~223 |
@@ -1229,6 +1233,8 @@ class Request:
 | `tests/test_migration.py` | 测试：迁移状态机 + 事务 + 幂等 | ~151 |
 | `tests/test_kv_migration.py` | 测试：KV 块增量 diff + prefix cache | ~110 |
 | `tests/test_kv_transport.py` | 测试：KV 传输后端（key 协议 + 工厂 + mock relay） | ~200 |
+| `tests/test_storage_tier.py` | 测试：分层存储换入换出 + 预取决策 | ~150 |
+| `tests/test_global_prefix_index.py` | 测试：全局前缀索引 + 权重共享记账 | ~130 |
 | `tests/test_node_registry.py` | 测试：节点注册/心跳/死节点检测 | ~130 |
 | `tests/test_storage_checkpoint_engine.py` | 测试：nfs / mooncake_mock / mooncake | ~483 |
 | `verify_dependencies.sh` | 依赖验证脚本 | ~120 |
@@ -1967,6 +1973,19 @@ vLLM 核心修改（最小侵入，G5）：
 | **KV 数据面走 Ray TCP（默认）** | `export/import_kv_blocks` 经 Ray Object Store 跨节点传输，非 RDMA | 已抽象为 `KVTransport`：`mooncake_rdma` 后端走 P2P RDMA（worker put/get store，tensor 不经 driver）；骨架已落地，真机带宽/GPU-direct 优化待验证 |
 | **GDS 未实现** | GPUDirect Storage（GPU↔NVMe 直通）无后端，NFS 是 CPU 路径、Mooncake 是 RDMA 内存 | 需 cufile + GPUDirect 存储，作为 `StorageBackend` 新后端预留（硬件依赖，暂不落地） |
 | **编译等待硬编码** | 编译锁等待用 time.sleep(5) 轮询 | 改为事件通知/等待机制 |
+
+## 7.3 分层存储与高级能力（现状与边界）
+
+「Storage Backend 分层存储与高级能力」五项逐条核对，现状如下。纯逻辑
+决策模块已落地并可离线单测；涉及 GPU/RDMA 张量搬运的**执行侧**留真机。
+
+| 能力 | 现状 | 落地模块 | 边界 |
+|------|------|---------|------|
+| 三级分层存储（HBM/DRAM/REMOTE 自动换入换出） | 决策层已实现，执行层接线待真机 | `storage_tier.py`（`StorageTier` + `TieredCache` 容量/LRU/升降级决策） | `TieredCache` 只发 `EvictionDecision` 指令，不搬张量；与 `StorageBackend` 的绑定沿用「Ray Object Store(<50MB) + NFS/Mooncake(≥50MB)」既有接线 |
+| 同节点零拷贝传输 | 骨架已实现 | `kv_transport.py::CudaIpcTransport` + worker `export/import_kv_blocks_ipc`（`share_ipc`/`from_ipc_handle`） | 仅同节点；`torch.from_ipc_handle` API 兼容性需真机验证 |
+| 全局 KV 前缀共享 | 索引已实现 | `global_prefix_index.py`（`GlobalPrefixIndex`，按 `weight_hash` 分 key） | **KV 张量是权重相关的**：仅同 `weight_hash`（同 base+adapter）的 Actor 可复用前缀；「跨模型」严格限于权重一致 |
+| 模型权重共享（LoRA 多任务） | 记账已实现 | `weight_sharing.py`（`WeightShareLedger` + `cost_ratio` 量化 adapter/基地成本比） | worker `switch_adapter` 执行路径未落地（需 vLLM LoRA runtime 对接，真机） |
+| 异步 I/O 与预取 | 决策已实现 | `prefetch_policy.py`（`AccessHeatTracker` + `PrefetchPolicy` 热度排序/预算裁剪） | 后台加载线程/流水线执行未落地（真机，与迁移状态机异步化联动） |
 
 ---
 

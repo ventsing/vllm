@@ -181,12 +181,71 @@ class MooncakeRdmaTransport(KVTransport):
         return len(src_block_ids)
 
 
+@dataclass
+class KVBlockIpcHandle:
+    """Locator for a KV block shared via CUDA IPC (same-node zero-copy).
+
+    ``ipc_handles`` maps each cache group to the ``share_ipc()`` bytes for that
+    group's tensor. The destination worker maps the handle into its own address
+    space with ``torch.from_ipc_handle``, pointing at the *same* GPU memory, so
+    no CPU copy occurs. Valid only between processes on one node.
+    """
+
+    block_id: int
+    ipc_handles: dict[int, bytes]
+    shapes: dict[int, tuple[int, ...]]
+    dtype: str
+
+
+class CudaIpcTransport(KVTransport):
+    """Same-node zero-copy transport via CUDA IPC memory handles.
+
+    Source workers return only the tiny IPC handles (bytes + shape metadata);
+    the driver forwards them, and destination workers map them into their own
+    address space. The KV tensors never leave the GPU, reducing same-node
+    migration from a memcpy to an address-space mapping.
+    """
+
+    name = "cuda_ipc"
+
+    def ship(
+        self,
+        src_executor,
+        dst_executor,
+        src_block_ids,
+        block_mapping=None,
+        timeout=_MIGRATION_RPC_TIMEOUT,
+    ) -> int:
+        import ray
+
+        handles = ray.get(
+            [
+                h.actor.export_kv_blocks_ipc.remote(src_block_ids)
+                for h in src_executor.ray_worker_handles
+            ],
+            timeout=timeout,
+        )
+        ray.get(
+            [
+                dh.actor.import_kv_blocks_ipc.remote(
+                    rank_handles, block_mapping
+                )
+                for dh, rank_handles in zip(
+                    dst_executor.ray_worker_handles, handles
+                )
+            ],
+            timeout=timeout,
+        )
+        return len(src_block_ids)
+
+
 class KVTransportFactory:
     """Create a transport backend by name."""
 
     _registry: dict[str, type[KVTransport]] = {
         RayObjectStoreTransport.name: RayObjectStoreTransport,
         MooncakeRdmaTransport.name: MooncakeRdmaTransport,
+        CudaIpcTransport.name: CudaIpcTransport,
     }
 
     @classmethod

@@ -637,6 +637,70 @@ class ExternalWorkerActor:
             count += 1
         return count
 
+    # ----------------------------------- Same-node zero-copy (CUDA IPC)
+    def export_kv_blocks_ipc(self, block_ids: list[int]) -> list[dict]:
+        """Export KV blocks as CUDA IPC handles (same-node zero-copy).
+
+        Each group tensor's ``share_ipc()`` bytes are returned instead of the
+        tensor itself; the destination maps the handle into its own address
+        space, referencing the same GPU memory with no CPU copy.
+
+        Returns:
+            ``KVBlockIpcHandle``-shaped dicts (``block_id``, ``ipc_handles``,
+            ``shapes``, ``dtype``).
+        """
+        caches = self._get_kv_caches()
+        handles = []
+        for block_id in block_ids:
+            ipc = {}
+            shapes = {}
+            dtype_name = None
+            for gidx, cache in enumerate(caches):
+                tensor = cache[block_id]
+                ipc[gidx] = tensor.share_ipc()
+                shapes[gidx] = tuple(tensor.shape)
+                dtype_name = dtype_name or str(tensor.dtype)
+            handles.append(
+                {
+                    "block_id": block_id,
+                    "ipc_handles": ipc,
+                    "shapes": shapes,
+                    "dtype": dtype_name,
+                }
+            )
+        return handles
+
+    def import_kv_blocks_ipc(
+        self,
+        handles: list[dict],
+        block_mapping: dict[int, int] | None = None,
+    ) -> int:
+        """Map CUDA IPC handles into this worker's KV caches (zero-copy).
+
+        Args:
+            handles: ``KVBlockIpcHandle``-shaped dicts produced by
+                :meth:`export_kv_blocks_ipc`.
+            block_mapping: Optional ``src_block_id -> dst_block_id`` remap.
+
+        Returns:
+            Number of blocks mapped.
+        """
+        caches = self._get_kv_caches()
+        count = 0
+        for handle in handles:
+            dst_id = (block_mapping or {}).get(
+                handle["block_id"], handle["block_id"]
+            )
+            for gidx, ipc_bytes in handle["ipc_handles"].items():
+                mapped = torch.from_ipc_handle(
+                    ipc_bytes,
+                    device=caches[gidx].device,
+                    dtype=getattr(torch, handle["dtype"].split(".")[-1]),
+                )
+                caches[gidx][dst_id].view(mapped.shape).copy_(mapped)
+            count += 1
+        return count
+
     # -------------------------------------------- RDMA KV transport (Mooncake)
     def configure_kv_transport(self, store_config: dict | None) -> None:
         """Set the Mooncake store config used by the RDMA KV transport.
