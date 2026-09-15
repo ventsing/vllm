@@ -63,8 +63,8 @@
 - [x] 3.3 lease 代次 + 过期释放隔离（`lease_generation` + `release_actors` 校验 lease_id）
 - [x] 4.1 可停止执行循环（run 起后台 daemon 线程，`_stop_event` + dequeue timeout 可退出）
 - [x] 4.2 reset 失败隔离（reset 抛异常 + 标 FAILED；release 侧 reset 成功才归还）
-- [ ] 4.3 shutdown 不 kill / 幂等（真机）
-- [ ] 5.1 唯一 MVP 入口（真机）
+- [x] 4.3 shutdown 不 kill / 幂等（overridden：reset actor + 关 MQ，不 `ray.kill` 池资产）
+- [ ] 5.1 唯一 MVP 入口（try/finally acquire/release + 示例 + AsyncLLM 路径，真机）
 - [ ] P1 测试 + 量化
 - [ ] P2 后续项（延后/报错）
 

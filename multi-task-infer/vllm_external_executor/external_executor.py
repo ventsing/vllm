@@ -586,7 +586,44 @@ class ExternalExecutor(RayExecutorV2):
         
         self.ray_worker_handles = []
         logger.info("Actors released")
-    
+
+    def shutdown(self) -> None:
+        """Tear down the executor without killing pool-owned actors.
+
+        ``RayExecutorV2.shutdown`` ``ray.kill()``s the workers it created;
+        this executor only *leases* pre-started actors from an
+        ``ActorPoolManager``, so shutdown instead resets each actor (freeing
+        worker/model/KV resources and stopping its busy loop) and closes the
+        message queues, leaving the actors alive in the pool for reuse.
+        Idempotent.
+        """
+        import ray
+
+        lock = getattr(self, "shutdown_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if getattr(self, "shutting_down", False):
+                return
+            self.shutting_down = True
+
+        self._join_monitor_thread()
+
+        for handle in getattr(self, "ray_worker_handles", []):
+            try:
+                ray.get(handle.actor.reset.remote())
+            except Exception:
+                logger.exception("Failed to reset actor rank=%d", handle.rank)
+
+        if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
+            rpc_broadcast_mq.shutdown()
+            self.rpc_broadcast_mq = None
+
+        for mq in getattr(self, "response_mqs", []):
+            mq.shutdown()
+        self.response_mqs = []
+        self.ray_worker_handles = []
+
     def switch_model(
         self,
         new_vllm_config: VllmConfig,
