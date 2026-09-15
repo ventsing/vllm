@@ -52,21 +52,45 @@
 
 - [x] 2.1 设备编号映射统一（移除 `cuda:{device_id}` 直接绑定；绑定改由
       `init_device()` 经 `assigned_physical_gpu_ids`+`local_rank` 完成）
-- [x] 2.2 修复 `_group_workers_by_node()` 调用（删除死调用，分组已在 Step 4 内联）
-- [x] 2.3 初始化顺序（`create_dist_init_method(world_size)` 不再读 self.vllm_config）
-- [x] 2.4 `rpc_rank` / `all_kwargs` 对齐（传完整 per-rank `all_kwargs`，`rpc_rank=rank`）
-- [x] 2.5 READY 语义（`wait_for_init` 仅 worker+response MQ 就绪才 READY）
+- [x] 2.2 修复 `_group_workers_by_node()` 调用（删除死调用，分组 Step 4 内联）
+- [x] 2.3 初始化顺序（`create_dist_init_method(world_size)` 不读 self.vllm_config）
+- [x] 2.4 `rpc_rank`/`all_kwargs` 对齐（完整 per-rank `all_kwargs`，`rpc_rank=rank`）
+- [x] 2.5 READY 语义（`wait_for_init` 仅 worker + response MQ 就绪才 READY）
 - [x] 2.6 `ResponseStatus` 对齐（响应用 `WorkerProc.ResponseStatus.SUCCESS/FAILURE`）
 - [x] 2.7 字符串/callable RPC（`_execute_worker_rpc` 支持 str + bytes/cloudpickle）
 - [x] 3.1 原子租约（`try_acquire` select+grant 合并，短缺无部分租用）
 - [x] 3.2 心跳不覆盖租约（`heartbeat` 仅 liveness，不动 state/lease）
 - [x] 3.3 lease 代次 + 过期释放隔离（`lease_generation` + `release_actors` 校验 lease_id）
-- [x] 4.1 可停止执行循环（run 起后台 daemon 线程，`_stop_event` + dequeue timeout 可退出）
+- [x] 4.1 可停止执行循环（run 起后台 daemon 线程，`_stop_event`+dequeue timeout）
 - [x] 4.2 reset 失败隔离（reset 抛异常 + 标 FAILED；release 侧 reset 成功才归还）
-- [x] 4.3 shutdown 不 kill / 幂等（overridden：reset actor + 关 MQ，不 `ray.kill` 池资产）
-- [ ] 5.1 唯一 MVP 入口（try/finally acquire/release + 示例 + AsyncLLM 路径，真机）
+- [x] 4.3 shutdown 不 kill / 幂等（reset actor + 关 MQ，不 `ray.kill` 池资产）
+- [x] 5.1 唯一 MVP 入口（`mvp_entry.run_mvp`：acquire → AsyncLLM → finally
+      release；`validate_mvp_config` 显式报错；`examples/mvp_example.py`）
 - [ ] P1 测试 + 量化
 - [ ] P2 后续项（延后/报错）
+
+## 六、真机验证清单（GPU 环境执行；纯逻辑/代码修复已离线验证）
+
+以下项已按 vLLM `RayExecutorV2`/`WorkerProc` 参考实现完成代码修复，并通过
+`py_compile` + 离线逻辑校验，但**尚未在真实 GPU 上跑通**，需按顺序验证：
+
+1. `examples/mvp_example.py`（TP=1，两个模型顺序复用同一批 Actor）能端到端
+   出字，无 `AttributeError`/`ResponseStatus` 误判/`collective_rpc` 超时。
+2. TP=2（`tp_size=2`）启动：`all_kwargs` 长度、`rpc_rank=rank`、设备映射
+   （`assigned_physical_gpu_ids`）在多 worker 下正确。
+3. 任务完成后 `pool.release` 归还租约，registry `free_gpus` 恢复，下一个
+   任务能再次 `acquire` 同一批 Actor；中断（Ctrl-C / 异常）后 `finally` 归还。
+4. 心跳线程不把租用中的 Actor 覆盖回 idle；`reset` 失败时 Actor 被隔离
+   （标记 FAILED + `mark_actor_failed`），不被再次分配。
+5. 启动收益量化：预热池 vs 冷启动 vLLM 的端到端时延对比（P1 第七节）。
+
+## 七、P1 量化脚本（待真机）
+
+- 基线：`AsyncLLM` 冷启动（无池）加载模型 → 首次生成时延。
+- 池化：预热池 + `run_mvp` 顺序两个模型 → 每模型首次生成时延。
+- 记录指标：acquire 耗时、`initialize_worker` 耗时、`load_model` 耗时、
+  首次生成时延、端到端墙钟；输出「预热池相对冷启动的加速比」为实测值，
+  未测的加速一律标注「待验证」，不做未经验证的倍数声明。
 
 ## 五、遗留注记（P2 热切换/展示一致性，非 MVP 路径）
 
