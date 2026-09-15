@@ -53,8 +53,9 @@
 3. **P0 唯一入口**（5.1）：AsyncLLM 路径 + 示例修正 + try/finally。
 4. **P1 测试 + 量化**（六、七）：纯逻辑单测先行，生命周期用真实 Ray 集成测试
    （真机），量化收益记录脚本。
-5. **P2 后续**：跨节点缓存、权重预取、动态 TP/PP、热切换、KV 迁移一致性、
-   扩缩容（修复缩容索引错位 + 扩容设备映射）、LoRA、分层存储。
+5. **P2 后续**（详见 [docs/p2_followups.md](docs/p2_followups.md)）：跨节点缓存、
+   权重预取、动态 TP/PP、热切换、KV 迁移一致性、扩缩容（修复缩容索引错位 +
+   扩容设备映射）、LoRA、分层存储。
 
 ## 四、进度 checklist
 
@@ -78,6 +79,14 @@
       调度/传输/存储；本轮补齐 weight_sharing + prefetch_policy）
 - [ ] P1 真机集成测试 + 量化数字（第六/七节，待 GPU 运行 benchmark 脚本）
 - [x] P2 显式报错/延后（executor 层已落地，见第八节；实现代码保留不动）
+
+## 五、遗留注记（展示一致性，非 MVP 路径）
+
+- `get_info`/`wait_for_ready` 返回的 `physical_gpu_ids` 仍是 `[self.device_id]`
+  （Ray control id），与 `get_node_and_physical_gpu_ids`（经
+  `device_control_id_to_physical_device_id` 得到的 physical id）来源不一致。
+  当前仅 registry 稳定身份使用 `device_id`，设备绑定不消费该字段，故不影响
+  MVP；真机验证时若需要权威 physical id，统一到 `get_accelerator_ids`。
 
 ## 六、真机验证清单（GPU 环境执行；纯逻辑/代码修复已离线验证）
 
@@ -104,31 +113,10 @@
   `speedup_run`（cold 总和 / run 总和）两个实测加速比；JSON 可选。
   未运行的加速一律标「待验证」，不做未经验证的倍数声明。
 
-## 五、遗留注记（P2 热切换/展示一致性，非 MVP 路径）
+## 八、P2 后续事项 → [docs/p2_followups.md](docs/p2_followups.md)
 
-- `switch_model`（`external_worker_actor.py` 约 515-530 行）重建 WorkerWrapperBase
-  时仍用 `rpc_rank=self._local_rank` + 单元素 `all_kwargs`，与 2.4 是同一 bug。
-  该路径属于 P2「热切换」，MVP 用顺序复用不经过它；现已用 `NotImplementedError`
-  门控（见第八节），P2 启用时必须先修该 bug 再撤门控。
-- `get_info`/`wait_for_ready` 返回的 `physical_gpu_ids` 仍是 `[self.device_id]`
-  （Ray control id），与 `get_node_and_physical_gpu_ids`（经
-  `device_control_id_to_physical_device_id` 得到的 physical id）来源不一致。
-  当前仅 registry 稳定身份使用 `device_id`，设备绑定不消费该字段，故不影响
-  MVP；真机验证时若需要权威 physical id，统一到 `get_accelerator_ids`。
-
-## 八、P2 显式报错/延后（已落地）
-
-P2 未验证路径在 MVP 阶段被显式挡在入口之外；实现代码保留不动，P2 启用时
-先修对应 bug 再撤门控：
-
-| 能力 | 门控位置 | 行为 |
-|------|---------|------|
-| 热切换 `switch_model` | `external_executor.py` `switch_model` 入口 | `NotImplementedError` |
-| 编译缓存共享 | `ExternalExecutor.__init__`（`cache_manager` 非 None） | `NotImplementedError` |
-| 决策层共享句柄 | `__init__`（`prefix_index`/`weight_ledger`/`heat_tracker`/`tiered_cache`/`prefetch_policy` 非 None） | `NotImplementedError` |
-| TP/PP/LoRA/KV-connector/elastic-EP | `ExternalExecutor._validate_mvp_scope`（复用 `validate_mvp_config`） | `ValueError` |
-| 动态扩缩容 | 不调用 `set_autoscaler`/`maybe_autoscale`（默认禁用） | 无副作用 |
-
-- P2 启用扩缩容前：修复 `_scale_down_actors` 缩容删除列表中间元素造成的索引
-  错位（当前已用尾部删除规避），并复核扩容设备映射。
-- P2 启用热切换前：修复 `switch_model` 的 `rpc_rank`/`all_kwargs`（见第五节）。
+P2 未验证路径在 MVP 阶段被显式挡在入口之外（`NotImplementedError` /
+`validate_mvp_config` 报错 / `cache_manager` 与决策层句柄拒绝），实现代码
+保留不动。逐项规划、门控位置与「启用前必修」bug 已移至
+[docs/p2_followups.md](docs/p2_followups.md)，启用时可按下述顺序：修 bug →
+撤门控 → 补测试 → 建立该能力的真机验证清单。
