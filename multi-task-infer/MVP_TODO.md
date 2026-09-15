@@ -41,6 +41,7 @@
 |---|----|------|------|
 | 2.8 | worker 存活监控 | `run()` 立即返回，继承的 `start_worker_monitor` 以 `run_ref` 完成为「死亡」信号，启动即误判 shutdown | 覆盖为 `heartbeat` 轮询（`external_executor.py`） |
 | 2.9 | 编译时序 | `_init_executor` 提前 `compile_or_warm_up_model`，在 EngineCore 分配 KV cache 前 capture CUDA Graph，重复且有害 | 删除提前调用，交给 EngineCore `_initialize_kv_caches` 标准流程 |
+| 2.10 | executor 生命周期 | `run_mvp` 不调 `llm.shutdown()`，EngineCore→ExternalExecutor.shutdown 链不触发，driver 侧 MQ 泄漏共享内存 | `finally` 里先 `llm.shutdown()` 再 `pool.release`（`mvp_entry.py`） |
 
 ## 三、执行顺序
 
