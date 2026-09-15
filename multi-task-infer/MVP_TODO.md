@@ -35,6 +35,13 @@
 4.2、2.6 的状态判定部分）与**设备编号映射逻辑**；「真机」项集中在真实 Worker
 初始化（2.4、2.5、2.7）、可停止执行循环（4.1）、进程/通信组生命周期（4.3）。
 
+### 二.1 补充启动修复（静态审查对照 vLLM 参考实现新增，均已修复）
+
+| # | 项 | 问题 | 修复 |
+|---|----|------|------|
+| 2.8 | worker 存活监控 | `run()` 立即返回，继承的 `start_worker_monitor` 以 `run_ref` 完成为「死亡」信号，启动即误判 shutdown | 覆盖为 `heartbeat` 轮询（`external_executor.py`） |
+| 2.9 | 编译时序 | `_init_executor` 提前 `compile_or_warm_up_model`，在 EngineCore 分配 KV cache 前 capture CUDA Graph，重复且有害 | 删除提前调用，交给 EngineCore `_initialize_kv_caches` 标准流程 |
+
 ## 三、执行顺序
 
 1. **P0 纯逻辑先行**（本仓库可离线修 + 单测）：3.1 原子租约、3.2 心跳不覆盖、
