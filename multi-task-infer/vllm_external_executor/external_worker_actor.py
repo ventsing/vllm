@@ -59,15 +59,13 @@ class ExternalWorkerActor:
                 omitted); used by the central registry for heartbeat/rebuild.
             fault_domain: Failure-domain label inherited from the host node.
         """
-        # 1. Bind to device
+        # 1. Record device identity (Ray control id). Do NOT bind a CUDA device
+        # here: Ray isolates one GPU per actor via CUDA_VISIBLE_DEVICES, and the
+        # logical-to-physical mapping is resolved in init_device() from
+        # assigned_physical_gpu_ids + local_rank (see GPUWorker.init_device).
         self.device_id = device_id
-        self.device = torch.device(f"cuda:{device_id}")
         self.actor_id = actor_id
         self.fault_domain = fault_domain
-        
-        # Set device for this process
-        if torch.cuda.is_available():
-            torch.cuda.set_device(self.device)
         
         # 2. Import common libraries (warm up imports)
         self._import_common_libraries()
@@ -256,57 +254,45 @@ class ExternalWorkerActor:
         self,
         vllm_config,
         rank: int,
-        local_rank: int,
-        distributed_init_method: str,
+        all_kwargs: list,
         input_shm_handle,
-        is_driver_worker: bool,
         is_driver_node: bool = False,
     ) -> None:
         """
         Initialize the worker (called by ExternalExecutor).
-        
+
         Creates WorkerWrapperBase but does not perform device initialization.
-        
+        Mirrors RayWorkerWrapper: ``all_kwargs`` is the full per-rank kwargs
+        list and this actor picks its own entry via its global ``rank``, so
+        TP>1 keeps ``rpc_rank`` and ``all_kwargs`` length aligned.
+
         Args:
             vllm_config: vLLM configuration
             rank: Global rank of this worker
-            local_rank: Local rank within the node
-            distributed_init_method: Distributed initialization method
+            all_kwargs: Per-rank worker kwargs (length == world size)
             input_shm_handle: Shared memory handle for broadcast MessageQueue
-            is_driver_worker: Whether this is the driver worker
             is_driver_node: Whether this actor is on the driver node
         """
         from vllm.v1.worker.worker_base import WorkerWrapperBase
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-        
-        # Store config
+
         self.vllm_config = vllm_config
         self._is_driver_node = is_driver_node
-        
-        # Save init kwargs for later switch_model (worker rebuild)
+
+        kwargs = all_kwargs[rank]
         self._rank = rank
-        self._local_rank = local_rank
-        self._dist_init_method = distributed_init_method
-        self._is_driver_worker = is_driver_worker
-        
-        # Create WorkerWrapperBase
-        wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
-        wrapper.init_worker(all_kwargs=[{
-            "vllm_config": vllm_config,
-            "local_rank": local_rank,
-            "rank": rank,
-            "distributed_init_method": distributed_init_method,
-            "is_driver_worker": is_driver_worker,
-        }])
-        
+        self._local_rank = kwargs["local_rank"]
+        self._dist_init_method = kwargs["distributed_init_method"]
+        self._is_driver_worker = kwargs["is_driver_worker"]
+
+        wrapper = WorkerWrapperBase(rpc_rank=rank, global_rank=rank)
+        wrapper.init_worker(all_kwargs)
         self.worker = wrapper
-        
-        # Initialize message queues
+
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(
             input_shm_handle, self.worker.rank
         )
-        
-        # Use ray's internal IP for cross-node communication
+
         import ray
         n_local = 1 if is_driver_node else 0
         self.worker_response_mq = MessageQueue(
@@ -314,31 +300,35 @@ class ExternalWorkerActor:
             n_local_reader=n_local,
             connect_ip=ray.util.get_node_ip_address(),
         )
-        
+
         self.state = ActorState.LEASED
-    
-    def create_dist_init_method(self) -> str:
+
+    def create_dist_init_method(self, world_size: int) -> str:
         """
         Create a distributed initialization method.
-        
+
+        Args:
+            world_size: Total number of workers (TP x PP). Passed by the
+                executor so this method needs no prior ``vllm_config``.
+
         Returns:
             Distributed initialization method string
         """
         import ray
         from torch.distributed import TCPStore
         from vllm.utils.network_utils import get_distributed_init_method
-        
+
         host = ray.util.get_node_ip_address()
         store = TCPStore(
             host_name=host,
             port=0,
-            world_size=self.vllm_config.parallel_config.world_size,
+            world_size=world_size,
             is_master=True,
             wait_for_workers=False,
             multi_tenant=True,
         )
         self._dist_init_store = store
-        
+
         return get_distributed_init_method(host, store.port)
     
     def init_device(self) -> None:

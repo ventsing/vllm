@@ -274,9 +274,12 @@ class ExternalExecutor(RayExecutorV2):
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         
         # Step 4: Initialize workers
-        # Get distributed init method from first worker
+        # Get distributed init method from the first worker. Pass world_size so
+        # the worker does not need a vllm_config of its own yet (see 2.3).
         distributed_init_method = ray.get(
-            self.ray_worker_handles[0].actor.create_dist_init_method.remote()
+            self.ray_worker_handles[0].actor.create_dist_init_method.remote(
+                self.world_size
+            )
         )
         
         # Discover physical GPU IDs
@@ -297,28 +300,35 @@ class ExternalExecutor(RayExecutorV2):
         for node_id in node_physical_gpu_ids:
             node_physical_gpu_ids[node_id] = sorted(node_physical_gpu_ids[node_id])
         
-        # Initialize each worker
-        init_worker_refs = []
-        for i, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
-            local_rank = node_workers[node_id].index(i)
+        tp_size = self.parallel_config.tensor_parallel_size
+        
+        # Build the full per-rank kwargs list (same shape as RayExecutorV2) so
+        # every actor can pick its own entry by global rank.
+        all_kwargs = []
+        for rank, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
+            local_rank = node_workers[node_id].index(rank)
             assigned_physical_gpu_ids = sorted(node_physical_gpu_ids[node_id])
-            
-            self.ray_worker_handles[i].local_rank = local_rank
-            
-            is_driver_worker = self._is_driver_worker(
-                self.ray_worker_handles[i].rank
-            )
-            is_driver_node = node_id == driver_node
-            
+            self.ray_worker_handles[rank].local_rank = local_rank
+            all_kwargs.append({
+                "vllm_config": self.vllm_config,
+                "assigned_physical_gpu_ids": assigned_physical_gpu_ids,
+                "local_rank": local_rank,
+                "rank": rank,
+                "distributed_init_method": distributed_init_method,
+                "is_driver_worker": rank % tp_size == 0,
+            })
+        
+        # Each actor independently initializes, passing the full all_kwargs
+        # with its own rank so rpc_rank and all_kwargs length stay aligned.
+        init_worker_refs = []
+        for rank, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
             init_worker_refs.append(
-                self.ray_worker_handles[i].actor.initialize_worker.remote(
+                self.ray_worker_handles[rank].actor.initialize_worker.remote(
                     vllm_config=self.vllm_config,
-                    rank=self.ray_worker_handles[i].rank,
-                    local_rank=local_rank,
-                    distributed_init_method=distributed_init_method,
+                    rank=rank,
+                    all_kwargs=all_kwargs,
                     input_shm_handle=scheduler_output_handle,
-                    is_driver_worker=is_driver_worker,
-                    is_driver_node=is_driver_node,
+                    is_driver_node=(node_id == driver_node),
                 )
             )
         
