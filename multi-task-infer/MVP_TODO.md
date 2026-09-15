@@ -50,10 +50,11 @@
 
 ## 四、进度 checklist
 
-- [ ] 2.1 设备编号映射统一
+- [x] 2.1 设备编号映射统一（移除 `cuda:{device_id}` 直接绑定；绑定改由
+      `init_device()` 经 `assigned_physical_gpu_ids`+`local_rank` 完成）
 - [x] 2.2 修复 `_group_workers_by_node()` 调用（删除死调用，分组已在 Step 4 内联）
-- [ ] 2.3 初始化顺序（config 先于 dist init）
-- [ ] 2.4 `rpc_rank` / `all_kwargs` 对齐
+- [x] 2.3 初始化顺序（`create_dist_init_method(world_size)` 不再读 self.vllm_config）
+- [x] 2.4 `rpc_rank` / `all_kwargs` 对齐（传完整 per-rank `all_kwargs`，`rpc_rank=rank`）
 - [ ] 2.5 READY 语义（真机）
 - [ ] 2.6 `ResponseStatus` 对齐
 - [ ] 2.7 字符串/callable RPC（真机）
@@ -66,3 +67,15 @@
 - [ ] 5.1 唯一 MVP 入口（真机）
 - [ ] P1 测试 + 量化
 - [ ] P2 后续项（延后/报错）
+
+## 五、遗留注记（P2 热切换/展示一致性，非 MVP 路径）
+
+- `switch_model`（`external_worker_actor.py` 约 515-530 行）重建 WorkerWrapperBase
+  时仍用 `rpc_rank=self._local_rank` + 单元素 `all_kwargs`，与 2.4 是同一 bug。
+  该路径属于 P2「热切换」，MVP 用顺序复用（reset → 重新 acquire →
+  `initialize_worker`）不经过它，故暂不修，P2 时必须一并对齐。
+- `get_info`/`wait_for_ready` 返回的 `physical_gpu_ids` 仍是 `[self.device_id]`
+  （Ray control id），与 `get_node_and_physical_gpu_ids`（经
+  `device_control_id_to_physical_device_id` 得到的 physical id）来源不一致。
+  当前仅 registry 稳定身份使用 `device_id`，设备绑定不消费该字段，故不影响
+  MVP；真机验证时若需要权威 physical id，统一到 `get_accelerator_ids`。
