@@ -8,6 +8,7 @@ new pool or actor creation.
 
 import ray
 
+from vllm_external_executor import ActorPoolManager
 from vllm_external_executor.mvp_entry import run_mvp
 
 PROMPTS = [
@@ -26,13 +27,22 @@ MODELS = [
 def main() -> None:
     ray.init()
 
-    for model in MODELS:
-        outputs = run_mvp(model, PROMPTS, tp_size=TP_SIZE)
-        print(f"=== {model} (TP={TP_SIZE}) ===")
-        for prompt, text in zip(PROMPTS, outputs):
-            print(f"  {prompt!r} -> {text!r}")
-
-    ray.shutdown()
+    # One pre-started pool serves every model in sequence.
+    pool = ActorPoolManager()
+    pool.pre_start(
+        num_actors=TP_SIZE,
+        devices_per_node=list(range(TP_SIZE)),
+        warmup_distributed=True,
+    )
+    try:
+        for model in MODELS:
+            outputs = run_mvp(model, PROMPTS, tp_size=TP_SIZE, pool=pool)
+            print(f"=== {model} (TP={TP_SIZE}) ===")
+            for prompt, text in zip(PROMPTS, outputs):
+                print(f"  {prompt!r} -> {text!r}")
+    finally:
+        pool.shutdown()
+        ray.shutdown()
 
 
 if __name__ == "__main__":
