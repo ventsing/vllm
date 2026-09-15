@@ -2,11 +2,12 @@
 
 ## 当前状态
 
-✅ 已完成：
-- 代码整理和清理
-- 创建分支 `feature/external-executor`
-- 创建 commit（19 files changed, 5749 insertions）
-- 创建 PR 描述文件 `PR_DESCRIPTION.md`
+✅ 已完成并推送 `origin/feature/external-executor`（24 commits，HEAD `134e17976e`）：
+
+- 48 files changed（+13920 / −2，实时核对：`git diff --stat origin/main...HEAD`）
+- 核心 vLLM 修改仅 8 文件（+159 / −2，最小侵入）
+- 插件 `vllm_external_executor/` 17 个模块 + `tests/` 10 个测试模块
+- PR 描述 `PR_DESCRIPTION.md` + 真机验证清单 `HARDWARE_VALIDATION.md`
 
 ## 推送步骤
 
@@ -71,7 +72,7 @@ gh auth login
 
 # 推送并创建 PR
 git push -u origin feature/external-executor
-gh pr create --title "feat: ExternalExecutor plugin with actor pooling and storage backend" \
+gh pr create --title "feat: ExternalExecutor — actor pool, model hot-switching, KV migration" \
              --body-file multi-task-infer/PR_DESCRIPTION.md
 ```
 
@@ -84,7 +85,7 @@ gh pr create --title "feat: ExternalExecutor plugin with actor pooling and stora
 1. 访问 https://github.com/ventsing/vllm
 2. 你应该能看到 "Compare & pull request" 按钮
 3. 点击按钮，填写 PR 信息：
-   - **Title**: `feat: ExternalExecutor plugin with actor pooling and storage backend`
+   - **Title**: `feat: ExternalExecutor — actor pool, model hot-switching, KV migration`
    - **Base branch**: `main`（或你的目标分支）
    - **Compare branch**: `feature/external-executor`
    - **Description**: 复制 `PR_DESCRIPTION.md` 的内容
@@ -96,7 +97,7 @@ gh pr create --title "feat: ExternalExecutor plugin with actor pooling and stora
 cd /home/ventsing/source/opensource/ai/llm/vllm
 
 gh pr create \
-  --title "feat: ExternalExecutor plugin with actor pooling and storage backend" \
+  --title "feat: ExternalExecutor — actor pool, model hot-switching, KV migration" \
   --body-file multi-task-infer/PR_DESCRIPTION.md \
   --base main \
   --head feature/external-executor
@@ -106,38 +107,69 @@ gh pr create \
 
 ### 核心功能
 
-1. **Actor Pooling**：预启动 Ray Actor，跨 vLLM 实例复用
-2. **Compilation Cache Sharing**：CacheManagerActor 管理编译缓存
-3. **Storage Checkpoint Engine**：从 NFS/Mooncake Store 加载模型权重
+1. **Actor Pooling**：预启动 Ray Actor，跨 vLLM 实例复用（含跨节点注册、
+   故障域调度、节点/actor 级故障转移）
+2. **Model Hot-switching**：迁移状态机驱动的模型热切换（原子事务 + 幂等 +
+   补偿回滚）
+3. **Cross-engine KV Migration**：增量、前缀感知、异构块重映射的 KV 迁移，
+   Pluggable transport（Ray / Mooncake RDMA / CUDA IPC）
+4. **Compilation Cache Sharing**：CacheManagerActor 管理编译缓存
+5. **Storage Checkpoint Engine**：从 NFS/Mooncake Store 加载模型权重
+6. **Decision Layer**：三层存储 tiering / 全局前缀索引 / 权重共享账本 /
+   异步预取（`migration_orchestrator.py` 接入迁移状态机）
+7. **Elastic Autoscaling**：按队列/P99/利用率水位 + 时段窗口 + 冷却自动扩缩
+   Actor 池（`autoscaling.py` + `maybe_autoscale`）
+
+详见 `PR_DESCRIPTION.md` 与 `HARDWARE_VALIDATION.md`。
 
 ### 文件结构
 
 ```
 multi-task-infer/
 ├── README.md                                    # 主文档
-├── design.md                                    # 4+1 视图设计文档
+├── design.md                                    # 4+1 视图设计文档（含场景 5.4.1/7.4 弹性扩缩容）
+├── PR_DESCRIPTION.md                            # PR 描述（提交时复制为 body）
+├── HARDWARE_VALIDATION.md                       # 真机验证清单（M1-M11）
 ├── STORAGE_CHECKPOINT_ENGINE_DESIGN.md          # 存储后端设计
 ├── STARTUP_DEPENDENCIES.md                      # 启动依赖清单
+├── PUSH_AND_PR_GUIDE.md                         # 本指南
 ├── pyproject.toml                               # 插件包配置
-├── vllm_external_executor/                      # 插件代码（5 个核心文件）
+├── vllm_external_executor/                      # 插件代码（17 个模块）
 │   ├── __init__.py
-│   ├── external_worker_actor.py                 # 预启动的 Ray Actor
-│   ├── actor_pool_manager.py                    # Actor 池管理器
-│   ├── external_executor.py                     # ExternalExecutor 实现
-│   ├── cache_manager_actor.py                   # CacheManagerActor 实现
-│   └── storage_checkpoint_engine.py             # 存储后端 checkpoint engine
-├── examples/                                    # 示例代码
-├── tests/                                       # 测试用例
+│   ├── external_worker_actor.py                 # 预启动的 Ray Actor（设备绑定 + KV 导出/导入）
+│   ├── actor_pool_manager.py                    # Actor 池（启停/租借/故障转移/弹性扩缩容）
+│   ├── external_executor.py                     # ExternalExecutor（迁移状态机 + 增量 KV）
+│   ├── cluster_state.py                         # NodeInfo / ActorRegistration / GlobalScheduler（纯）
+│   ├── node_registry_actor.py                   # 注册/心跳/统一视图/死检测
+│   ├── migration.py                             # 迁移状态机 + 原子事务 + 幂等
+│   ├── kv_migration.py                          # KV 增量 diff + 前缀感知
+│   ├── kv_transport.py                          # Ray / Mooncake RDMA / CUDA IPC 传输
+│   ├── storage_tier.py                          # 三级分层存储决策（纯）
+│   ├── global_prefix_index.py                   # 跨 Actor 前缀索引（纯）
+│   ├── weight_sharing.py                        # base+adapter 权重共享账本（纯）
+│   ├── prefetch_policy.py                       # 访问热度 + 异步预取（纯）
+│   ├── autoscaling.py                           # 弹性扩缩容决策（纯）
+│   ├── migration_orchestrator.py                # 决策层 → 迁移状态机接线
+│   ├── cache_manager_actor.py                   # 编译缓存共享
+│   └── storage_checkpoint_engine.py             # NFS / Mooncake 存储后端
+├── examples/                                    # 示例代码（3 个）
+├── tests/                                       # 测试（10 个模块）
 └── verify_dependencies.sh                       # 依赖验证脚本
 ```
 
+> 完整分层细节以 `design.md` §3.4 文件清单为准。
+
 ### vLLM 核心修改（最小侵入）
 
-仅修改 4 个文件用于参数传递：
-- `vllm/v1/engine/async_llm.py`
-- `vllm/v1/engine/core_client.py`
-- `vllm/v1/engine/utils.py`
-- `vllm/v1/engine/core.py`
+仅修改 8 个文件（+159 / −2 行）：
+- `vllm/v1/engine/async_llm.py` — 接受 `external_actors` 并传递（+5）
+- `vllm/v1/engine/core_client.py` — 线程化 `external_actors`（+9）
+- `vllm/v1/engine/utils.py` — 传递 `external_actors`（+4）
+- `vllm/v1/engine/core.py` — 传参 + `bind_scheduler` 钩子（+17/−1）
+- `vllm/v1/request.py` — 请求快照/恢复（+58）
+- `vllm/v1/core/block_pool.py` — KV 快照读接口（+20）
+- `vllm/v1/core/kv_cache_manager.py` — computed-token crop（+24）
+- `vllm/v1/core/kv_cache_coordinator.py` — 请求→块表访问器（+24）
 
 ## 验证推送
 
@@ -145,8 +177,8 @@ multi-task-infer/
 # 检查分支是否推送成功
 git branch -vv
 
-# 应该看到：
-# * feature/external-executor  37d2754423 [origin/feature/external-executor] feat: ExternalExecutor...
+# 应该看到（HEAD hash 以实际为准，当前为 134e17976e）：
+# * feature/external-executor  134e17976e [origin/feature/external-executor] ...
 
 # 检查远程分支
 git ls-remote origin feature/external-executor
