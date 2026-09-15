@@ -66,7 +66,9 @@
 - [x] 4.3 shutdown 不 kill / 幂等（reset actor + 关 MQ，不 `ray.kill` 池资产）
 - [x] 5.1 唯一 MVP 入口（`mvp_entry.run_mvp`：acquire → AsyncLLM → finally
       release；`validate_mvp_config` 显式报错；`examples/mvp_example.py`）
-- [ ] P1 测试 + 量化
+- [x] P1 纯逻辑测试齐全（13 个测试文件全部离线 PASS：租约/约束/决策层/迁移/
+      调度/传输/存储；本轮补齐 weight_sharing + prefetch_policy）
+- [ ] P1 真机集成测试 + 量化数字（第六/七节，待 GPU 运行 benchmark 脚本）
 - [x] P2 显式报错/延后（executor 层已落地，见第八节；实现代码保留不动）
 
 ## 六、真机验证清单（GPU 环境执行；纯逻辑/代码修复已离线验证）
