@@ -67,7 +67,7 @@
 - [x] 5.1 唯一 MVP 入口（`mvp_entry.run_mvp`：acquire → AsyncLLM → finally
       release；`validate_mvp_config` 显式报错；`examples/mvp_example.py`）
 - [ ] P1 测试 + 量化
-- [ ] P2 后续项（延后/报错）
+- [x] P2 显式报错/延后（executor 层已落地，见第八节；实现代码保留不动）
 
 ## 六、真机验证清单（GPU 环境执行；纯逻辑/代码修复已离线验证）
 
@@ -96,10 +96,27 @@
 
 - `switch_model`（`external_worker_actor.py` 约 515-530 行）重建 WorkerWrapperBase
   时仍用 `rpc_rank=self._local_rank` + 单元素 `all_kwargs`，与 2.4 是同一 bug。
-  该路径属于 P2「热切换」，MVP 用顺序复用（reset → 重新 acquire →
-  `initialize_worker`）不经过它，故暂不修，P2 时必须一并对齐。
+  该路径属于 P2「热切换」，MVP 用顺序复用不经过它；现已用 `NotImplementedError`
+  门控（见第八节），P2 启用时必须先修该 bug 再撤门控。
 - `get_info`/`wait_for_ready` 返回的 `physical_gpu_ids` 仍是 `[self.device_id]`
   （Ray control id），与 `get_node_and_physical_gpu_ids`（经
   `device_control_id_to_physical_device_id` 得到的 physical id）来源不一致。
   当前仅 registry 稳定身份使用 `device_id`，设备绑定不消费该字段，故不影响
   MVP；真机验证时若需要权威 physical id，统一到 `get_accelerator_ids`。
+
+## 八、P2 显式报错/延后（已落地）
+
+P2 未验证路径在 MVP 阶段被显式挡在入口之外；实现代码保留不动，P2 启用时
+先修对应 bug 再撤门控：
+
+| 能力 | 门控位置 | 行为 |
+|------|---------|------|
+| 热切换 `switch_model` | `external_executor.py` `switch_model` 入口 | `NotImplementedError` |
+| 编译缓存共享 | `ExternalExecutor.__init__`（`cache_manager` 非 None） | `NotImplementedError` |
+| 决策层共享句柄 | `__init__`（`prefix_index`/`weight_ledger`/`heat_tracker`/`tiered_cache`/`prefetch_policy` 非 None） | `NotImplementedError` |
+| TP/PP/LoRA/KV-connector/elastic-EP | `ExternalExecutor._validate_mvp_scope`（复用 `validate_mvp_config`） | `ValueError` |
+| 动态扩缩容 | 不调用 `set_autoscaler`/`maybe_autoscale`（默认禁用） | 无副作用 |
+
+- P2 启用扩缩容前：修复 `_scale_down_actors` 缩容删除列表中间元素造成的索引
+  错位（当前已用尾部删除规避），并复核扩容设备映射。
+- P2 启用热切换前：修复 `switch_model` 的 `rpc_rank`/`all_kwargs`（见第五节）。
