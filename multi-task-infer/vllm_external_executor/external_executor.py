@@ -421,22 +421,22 @@ class ExternalExecutor(RayExecutorV2):
         
         self.output_rank = self._get_output_rank()
         
-        # Step 9: Handle compilation optimization and cache management
-        self._handle_compilation_optimization()
-        
         logger.info("ExternalExecutor initialization complete")
     
     def _handle_compilation_optimization(self):
         """
-        Handle compilation optimization with lazy-loading pattern.
-        
-        Flow:
+        Handle compilation optimization with lazy-loading pattern (P2).
+
+        Not called by the MVP path: with no CacheManagerActor the executor
+        defers each model's compilation to vLLM's standard
+        ``EngineCore._initialize_kv_caches`` -> ``compile_or_warm_up_model``
+        flow, which runs *after* KV caches are sized (an early
+        ``compile_or_warm_up_model`` here would capture graphs against an
+        uninitialized cache). When P2 re-enables cache sharing, restore the
+        lazy flow:
         1. Check local cache → hit: skip compilation
         2. Pull from CacheManagerActor → hit: extract to local, skip compilation
         3. Fallback: compile via RPC, then push to CacheManagerActor
-        
-        This ensures workers only compile when necessary, and compiled
-        caches are shared across the cluster.
         """
         import os
         
