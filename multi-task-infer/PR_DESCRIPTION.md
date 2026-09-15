@@ -33,6 +33,12 @@ Adds an `ExternalExecutor` plugin for vLLM V1 that:
   awaited at LOAD) and registers transferred prefixes on the shared
   `GlobalPrefixIndex`. Both paths get compensation-based rollback of their own
   bookkeeping.
+- Ships **elastic actor-pool autoscaling**: a pure-logic `Autoscaler` decides
+  scale-up/scale-down from queue length, P99 latency, and resource utilization
+  (OR for scale-up, AND for scale-down), with per-signal watermarks, step size,
+  separate scale-up/scale-down cooldowns, and hourly `TimeWindowScale` windows
+  (including wrap-around). `ActorPoolManager.maybe_autoscale` executes the
+  decision via injected callbacks (defaults create/kill Ray actors).
 
 The plugin lives entirely under `multi-task-infer/` and hooks vLLM through the
 existing `vllm.general_plugins` entry point; core changes are intentionally
@@ -81,10 +87,11 @@ vllm_external_executor/
   global_prefix_index.py        # cross-actor prefix index, keyed by weight_hash (pure)
   weight_sharing.py             # base+adapter weight-share ledger + cost ratio (pure)
   prefetch_policy.py            # access heat + async prefetch decisions (pure)
+  autoscaling.py                # elastic scaling: watermarks + time windows + cooldown (pure)
   migration_orchestrator.py     # decision layer -> state machine wiring
   cache_manager_actor.py        # compile-cache sharing (G6)
   storage_checkpoint_engine.py  # NFS / Mooncake backends (G7)
-tests/                          # 9 test modules (pytest, pure-logic where possible)
+tests/                          # 10 test modules (pytest, pure-logic where possible)
 examples/                       # basic usage + incremental migration/failover sketches
 design.md                       # full design doc (4+1 view)
 ```
@@ -185,6 +192,11 @@ and a summary checkbox table for M1–M10) lives in
   (same base + adapter); KV tensors are weight-dependent.
 - CUDA Graph capture is not shared across models (documented; re-captured on
   switch).
+- Elastic autoscaling ships as a tested **decision layer** plus a wired
+  `ActorPoolManager.maybe_autoscale`; the Ray create/kill execution side
+  (`_scale_up_actors`/`_scale_down_actors`) needs a real cluster, and growing
+  past the `pre_start` placement-group bundle count is an operator concern
+  (inject a custom `scale_up_fn` to handle it).
 
 ## Pre-submit checklist (maintainer must run)
 

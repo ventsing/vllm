@@ -1223,6 +1223,7 @@ class Request:
 | `vllm_external_executor/global_prefix_index.py` | 跨 Actor 全局前缀哈希索引（同权重可复用，纯逻辑） | ~130 |
 | `vllm_external_executor/weight_sharing.py` | base+adapter 权重共享记账 + 迁移成本量化（纯逻辑） | ~100 |
 | `vllm_external_executor/prefetch_policy.py` | 访问热度追踪 + 异步预取决策（纯逻辑） | ~110 |
+| `vllm_external_executor/autoscaling.py` | 弹性扩缩容决策：队列/P99/利用率水位 + 时段窗口 + 冷却（纯逻辑） | ~270 |
 | `vllm_external_executor/migration_orchestrator.py` | 决策层→迁移状态机接线：异步预取 hook + tiering 搬运脚本 | ~220 |
 | `vllm_external_executor/cache_manager_actor.py` | CacheManagerActor 实现（G6） | ~474 |
 | `vllm_external_executor/storage_checkpoint_engine.py` | StorageCheckpointEngine + 后端（G7） | ~884 |
@@ -1237,6 +1238,7 @@ class Request:
 | `tests/test_storage_tier.py` | 测试：分层存储换入换出 + 预取决策 | ~150 |
 | `tests/test_global_prefix_index.py` | 测试：全局前缀索引 + 权重共享记账 | ~130 |
 | `tests/test_migration_orchestrator.py` | 测试：orchestrator 预取 hook + tiering 脚本 + 补偿 | ~160 |
+| `tests/test_autoscaling.py` | 测试：扩缩容水位/冷却/时段窗口/边界 clamp | ~150 |
 | `tests/test_node_registry.py` | 测试：节点注册/心跳/死节点检测 | ~130 |
 | `tests/test_storage_checkpoint_engine.py` | 测试：nfs / mooncake_mock / mooncake | ~483 |
 | `verify_dependencies.sh` | 依赖验证脚本 | ~120 |
@@ -1757,6 +1759,33 @@ vLLM 核心修改（最小侵入，G5）：
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 5.4.1 Actor 池按负载自动扩缩容（弹性扩缩容）
+
+> ✅ **实现状态：决策层已实现并接线**。`ActorPoolManager.maybe_autoscale()`
+> 按负载快照（`LoadMetrics`：队列长度 / P99 延迟 / 资源利用率）驱动
+> `Autoscaler`（`autoscaling.py`，纯逻辑）产出 `AutoscaleDecision`；执行侧
+> `_scale_up_actors`（Ray 创建 + 注册）/ `_scale_down_actors`（Ray kill +
+> 注销）在 SCALE_UP / SCALE_DOWN 时触发，也可通过 `set_autoscaler(scale_up_fn,
+> scale_down_fn)` 注入自定义执行侧。
+
+- **信号**：队列长度、P99 延迟、资源利用率三项。扩（SCALE_UP）用 **OR**
+  （任一信号越过高水位）；缩（SCALE_DOWN）用 **AND**（三项都低于低水位），
+  保守收缩避免单指标抖动导致频繁缩容。
+- **水位 + 步长**：`scale_up_queue_length/p99_ms/utilization` 与
+  `scale_down_*` 成对阈值；每次扩缩走 `scale_step` 个 Actor。
+- **冷却**：`cooldown_scale_up_seconds` / `cooldown_scale_down_seconds` 分开
+  记录，抑制振荡；`reset()` 清空冷却状态（如人工调整池大小后）。
+- **时段窗口**：`TimeWindowScale(start_hour, end_hour, min, max[, target])`
+  支持按小时抬高/压低边界或锚定目标（`target_actors` 逐 step 收敛）；支持
+  跨午夜窗口（`start_hour > end_hour`，如 22→6 覆盖夜间批处理）。
+- **边界**：目标恒被 clamp 到 `[max(config.min, window.min),
+  min(config.max, window.max)]`。
+
+**流程**：`maybe_autoscale(metrics, now)` → `Autoscaler.decide()` →
+`AutoscaleDecision(action, target_actors, reason)` → 执行侧按差值创建/销毁。
+`now` 由调用方注入单调时钟（`time.monotonic()`），决策层无 Ray/GPU 依赖、
+可离线测试。
+
 ## 5.5 场景 5：释放 Actor 回 Pool
 
 ```
@@ -1961,7 +1990,7 @@ vLLM 核心修改（最小侵入，G5）：
 
 | 约束 | 说明 | 影响 |
 |------|------|------|
-| **Actor 必须预启动** | ExternalExecutor 不创建 Actor，只从 Pool 获取 | 需要提前规划资源 |
+| **Actor 必须预启动** | ExternalExecutor 不创建 Actor，只从 Pool 获取 | 需要提前规划资源；弹性扩缩容（7.4）可让 Pool 按负载动态增长，但 `min_actors` 下限仍需预启动 |
 | **模型加载三路径可选** | 磁盘加载 / weight_transfer / 存储加载 (G7) | 按场景选择，不再强依赖 weight_transfer |
 | **数据通路固定** | 必须使用 MessageQueue（与 RayExecutorV2 一致） | 无法使用其他通信方式 |
 | **模型架构变化需重建** | 如果模型架构变化，需要重新创建模型结构 | 跨架构切换较慢 |
@@ -1994,6 +2023,12 @@ vLLM 核心修改（最小侵入，G5）：
 | 全局 KV 前缀共享 | 索引已实现 | `global_prefix_index.py`（`GlobalPrefixIndex`，按 `weight_hash` 分 key） | **KV 张量是权重相关的**：仅同 `weight_hash`（同 base+adapter）的 Actor 可复用前缀；「跨模型」严格限于权重一致 |
 | 模型权重共享（LoRA 多任务） | 记账已实现 | `weight_sharing.py`（`WeightShareLedger` + `cost_ratio` 量化 adapter/基地成本比） | worker `switch_adapter` 执行路径未落地（需 vLLM LoRA runtime 对接，真机） |
 | 异步 I/O 与预取 | 决策已实现，**hook 已接线**（PREPARING 启动 / LOAD 前 await；`ExternalExecutor._start_prefetch/_await_prefetch` 为注入点） | `prefetch_policy.py`（热度/预算）+ `migration.py` 阶段钩子 + `migration_orchestrator.py` + `external_executor.py::_drive_migration_orchestrator` | `_start_prefetch`/`_await_prefetch` 默认 no-op+日志，执行侧覆盖为后台线程/ray task 后即真正异步；线程/流水线执行留真机 |
+
+## 7.4 弹性扩缩容（现状与边界）
+
+| 能力 | 现状 | 落地模块 | 边界 |
+|------|------|---------|------|
+| 按负载自动扩缩容（队列/P99/利用率） | 决策层已实现，**已接线**（`ActorPoolManager.maybe_autoscale` → `Autoscaler.decide` → `_scale_up/_scale_down_actors`） | `autoscaling.py`（水位/步长/冷却/时段窗口）+ `actor_pool_manager.py::set_autoscaler/maybe_autoscale/_scale_up_actors/_scale_down_actors` | Ray 创建/销毁执行侧需真机验证；`pre_start` 的 placement group bundle 固定，扩容超出 bundle 需操作者处理（或注入自定义 `scale_up_fn`） |
 
 ---
 
