@@ -196,11 +196,34 @@ holder 集合与 cost ratio，切换 adapter 不重载 base。
    index/`node_mapping` 保持一致（无飘移）。
 3. 冷却期内重复采样返回 `NONE`（无抖动）；时段窗口抬高 floor 或锚定
    target 时按预期收敛。
-4. 超过 `pre_start` 的 placement-group bundle 上限时，注入的 `scale_up_fn`
-   接管（或按操作手册扩展 bundle）。
+4. 默认 `_scale_up_actors`（`num_gpus=1` 普通调度，不绑 PG）能创建新 Actor；
+   需 placement-group 亲和/排他时，注入 `scale_up_fn` 并按下方「操作手册」
+   扩展 bundle。
 
 **失败排查**：核对 `AutoscalingConfig` 水位 OR/AND 语义、`time_windows`
 跨午夜判定、`_scale_down_actors` 从尾部移除是否破坏 `_actor_id_to_idx`。
+
+**操作手册：placement-group 扩展（需 PG 亲和时）**
+
+默认 `_scale_up_actors` 用 `num_gpus=1` 普通调度（无 placement group），新增
+Actor 不占用 `pre_start` 按 `num_actors` 创建的 bundle，因此**不受 bundle
+数量上限**；代价是新 Actor 由 Ray 任意放置——可能与既有 Actor 不在同一
+故障域，或破坏 NCCL 拓扑亲和。
+
+需要强亲和时，二选一：
+
+1. **Ray ≥ 2.24 动态扩容**（推荐，不打断既有 Actor）：
+   ```python
+   import ray
+   pool.placement_group.add_bundles([{"GPU": 1} for _ in range(n)])
+   ray.get(pool.placement_group.ready(), timeout=30.0)
+   # 在 scale_up_fn 里用 PlacementGroupSchedulingStrategy 绑定新增 bundle
+   ```
+2. **预留 headroom**：`pre_start` 时按 `max_actors` 建 bundle、初始只起
+   `min_actors` 个 Actor，扩容时直接复用空闲 bundle（无需 `add_bundles`）。
+
+Ray < 2.24 无 `add_bundles`，重建 PG 会打断既有 Actor，因此**推荐方案 2
+（预留 headroom）或注入自定义 `scale_up_fn` 走普通调度**。
 
 ---
 
