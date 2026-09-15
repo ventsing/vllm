@@ -9,6 +9,7 @@ common libraries to speed up subsequent vLLM instance initialization.
 """
 
 import os
+import threading
 from enum import Enum
 from typing import Any
 
@@ -102,6 +103,11 @@ class ExternalWorkerActor:
         # Message queues (set during initialize_worker)
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
+
+        # Exec-loop control: reset() sets the stop event so a running busy loop
+        # exits cleanly before the actor is returned to the pool.
+        self._stop_event = threading.Event()
+        self._loop_thread: threading.Thread | None = None
     
     def _import_common_libraries(self):
         """Import common libraries to speed up subsequent initialization."""
@@ -865,62 +871,108 @@ class ExternalWorkerActor:
     
     def wait_for_init(self) -> dict:
         """
-        Wait for initialization to complete and return status.
-        
+        Report init status; READY is published only after the worker and its
+        response MQ are actually initialized, so a failed init is surfaced to
+        the executor instead of being masked by an unconditional READY.
+
         Returns:
-            Dictionary with status and response MQ handle
+            ``{"status": "READY", "handle": ...}`` on success; otherwise
+            ``{"status": "FAILED", "handle": None, "error": ...}``.
         """
+        if self.worker is None:
+            return {
+                "status": "FAILED",
+                "handle": None,
+                "error": "worker not initialized",
+            }
+        if self.worker_response_mq is None:
+            return {
+                "status": "FAILED",
+                "handle": None,
+                "error": "response MQ not ready",
+            }
         return {
             "status": "READY",
             "handle": self.worker_response_mq.export_handle(),
         }
     
     def run(self) -> None:
-        """Start the worker busy loop."""
+        """Start the worker busy loop on a background thread.
+
+        The loop runs on a daemon thread so ``run()`` returns immediately and
+        does not occupy the Ray actor's concurrency slot; heartbeat/reset/stop
+        stay responsive. ``reset()`` signals ``_stop_event`` to end the loop.
+        """
+        assert self.rpc_broadcast_mq is not None
+        self.rpc_broadcast_mq.wait_until_ready()
+        assert self.worker_response_mq is not None
+        self.worker_response_mq.wait_until_ready()
+
+        self._stop_event.clear()
+        self._loop_thread = threading.Thread(
+            target=self._loop, name="external-worker-busy-loop", daemon=True
+        )
+        self._loop_thread.start()
+
+    def _loop(self) -> None:
+        import logging
+
         try:
-            assert self.rpc_broadcast_mq is not None
-            self.rpc_broadcast_mq.wait_until_ready()
-            assert self.worker_response_mq is not None
-            self.worker_response_mq.wait_until_ready()
-            
             self.worker_busy_loop()
         except Exception as e:
-            import logging
-            logging.exception(f"ExternalWorkerActor failed: {e}")
-            raise
-        finally:
-            self.shutdown()
-    
+            logging.getLogger(__name__).exception(
+                "ExternalWorkerActor busy loop failed: %s", e
+            )
+
     def worker_busy_loop(self) -> None:
-        """Worker main loop (same as WorkerProc.worker_busy_loop)."""
-        while True:
-            rpc_request = self.rpc_broadcast_mq.dequeue(indefinite=True)
+        """Worker main loop; exits when ``_stop_event`` is set (reset)."""
+        while not self._stop_event.is_set():
+            try:
+                rpc_request = self.rpc_broadcast_mq.dequeue(timeout=0.5)
+            except TimeoutError:
+                continue
             self._execute_worker_rpc(rpc_request)
     
     def _execute_worker_rpc(self, rpc_request) -> None:
-        """Execute an RPC request.
-        
-        Follows vLLM's standard output_rank semantics (see
-        MultiprocExecutor._execute_worker_rpc): the result is only sent
-        when output_rank is None (all workers reply) or this worker is
-        the target (rank == output_rank).
+        """Execute one RPC and reply over the response MQ.
+
+        Mirrors ``WorkerProc._execute_worker_rpc``: ``method`` may be a str
+        (worker attribute name) or bytes (cloudpickle'd callable bound to the
+        worker). The reply is ``(WorkerProc.ResponseStatus.SUCCESS/FAILURE,
+        result)`` and is sent only when ``output_rank`` is None or this worker
+        is the target rank, matching the driver-side ``collective_rpc`` parser.
         """
         import logging
         logger = logging.getLogger(__name__)
-        
+        from vllm.v1.executor.multiproc_executor import WorkerProc
+
         method, args, kwargs, output_rank = rpc_request
-        
+
         try:
-            result = getattr(self.worker, method)(*args, **kwargs)
-            
-            # Send response
+            if isinstance(method, str):
+                func = getattr(self.worker, method)
+            elif isinstance(method, bytes):
+                from functools import partial
+                import cloudpickle
+                func = partial(cloudpickle.loads(method), self.worker)
+            else:
+                raise TypeError(f"Unsupported RPC method type: {type(method)}")
+
+            result = func(*args, **kwargs)
+
             if output_rank is None or self._rank == output_rank:
-                self.worker_response_mq.enqueue((True, result))
-                
+                self.worker_response_mq.enqueue(
+                    (WorkerProc.ResponseStatus.SUCCESS, result)
+                )
         except Exception as e:
+            if hasattr(e, "add_note"):
+                import traceback
+                e.add_note(traceback.format_exc())
             logger.exception("Worker RPC failed: %s", method)
             if output_rank is None or self._rank == output_rank:
-                self.worker_response_mq.enqueue((False, str(e)))
+                self.worker_response_mq.enqueue(
+                    (WorkerProc.ResponseStatus.FAILURE, str(e))
+                )
     
     def reset(self) -> None:
         """
@@ -930,6 +982,12 @@ class ExternalWorkerActor:
         left marked FAILED and never returned to IDLE, so the pool isolates it
         instead of re-leasing a half-cleaned actor.
         """
+        # Stop the busy loop before tearing down the worker/MQs it touches.
+        self._stop_event.set()
+        if self._loop_thread is not None and self._loop_thread.is_alive():
+            self._loop_thread.join(timeout=1.0)
+        self._loop_thread = None
+
         if self.worker is not None:
             try:
                 self.worker.shutdown()
