@@ -73,6 +73,8 @@ class ActorRegistration:
         state: Current lifecycle state (see ``ActorState``).
         lease_id: Id of the vLLM instance currently leasing this actor, or
             ``None`` when idle.
+        lease_generation: Monotonic counter bumped on every grant. A stale
+            release (older generation) must not disturb the current lease.
         last_heartbeat: ``time.time()`` of the last successful heartbeat.
         registered_at: ``time.time()`` at registration.
     """
@@ -83,6 +85,7 @@ class ActorRegistration:
     fault_domain: str
     state: str = IDLE_STATE
     lease_id: str | None = None
+    lease_generation: int = 0
     last_heartbeat: float = field(default_factory=time.time)
     registered_at: float = field(default_factory=time.time)
 

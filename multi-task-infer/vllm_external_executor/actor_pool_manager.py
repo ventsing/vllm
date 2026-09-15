@@ -21,7 +21,6 @@ import threading
 import uuid
 from typing import TYPE_CHECKING
 
-from vllm_external_executor.cluster_state import GlobalScheduler
 from vllm_external_executor.external_worker_actor import ActorState, ExternalWorkerActor
 
 if TYPE_CHECKING:
@@ -352,33 +351,30 @@ class ActorPoolManager:
         prefer = (
             ray.get_runtime_context().get_node_id() if prefer_driver_node else None
         )
-
-        regs = ray.get(
-            self.registry.list_actors.remote(), timeout=RPC_TIMEOUT
-        )
-        nodes = ray.get(
-            self.registry.list_nodes.remote(), timeout=RPC_TIMEOUT
-        )
-        selected_ids = GlobalScheduler.select_actors(
-            actors=regs,
-            nodes=nodes,
-            world_size=world_size,
-            fault_domain_constraint=fault_domain_constraint,
-            prefer_driver_node=prefer,
-        )
-
         lease_id = str(uuid.uuid4())
+
+        # Atomic select + grant in the registry: concurrent acquirers cannot
+        # grab the same actor and a shortfall leaves no partial lease.
+        selected_ids = ray.get(
+            self.registry.try_acquire.remote(
+                world_size,
+                lease_id,
+                fault_domain_constraint=fault_domain_constraint,
+                prefer_driver_node=prefer,
+            ),
+            timeout=RPC_TIMEOUT,
+        )
+        if len(selected_ids) < world_size:
+            raise RuntimeError(
+                f"Not enough idle actors: {len(selected_ids)} < {world_size} "
+                f"(constraint={fault_domain_constraint})"
+            )
+
         selected: list = []
         for actor_id in selected_ids:
             idx = self._actor_id_to_idx[actor_id]
             selected.append(self.actors[idx])
             self.states[idx] = ActorState.LEASED
-            ray.get(
-                self.registry.set_actor_state.remote(
-                    actor_id, ActorState.LEASED.value, lease_id
-                ),
-                timeout=RPC_TIMEOUT,
-            )
 
         self._leases[lease_id] = selected_ids
         logger.info(
@@ -388,15 +384,34 @@ class ActorPoolManager:
         return selected
 
     # ================================================================== release
-    def release(self, actors: list) -> None:
+    def release(self, actors: list, lease_id: str | None = None) -> None:
         """
-        Release actors back to the pool.
+        Release actors back to the pool, gated on lease identity.
+
+        Each actor is reset (worker resources torn down) *first*; only actors
+        that reset cleanly are returned to idle in the registry via
+        :meth:`release_actors`, which also verifies the lease still belongs to
+        this caller. A delayed/duplicated release from an older task therefore
+        cannot disturb a newer task holding the same actor.
 
         Args:
             actors: List of actor handles to release.
+            lease_id: Optional lease id. When omitted, it is recovered from the
+                pool's lease table (the lease owning these actors).
         """
         import ray
 
+        actor_ids = self._actor_ids_of(actors)
+        if not actor_ids:
+            return
+        if lease_id is None:
+            lease_id = self._lease_id_for(actor_ids)
+        if lease_id is None:
+            # Idempotent repeat release: nothing to do.
+            logger.warning("Release with no matching lease; skipping")
+            return
+
+        reset_ok: list[str] = []
         for actor in actors:
             try:
                 idx = self.actors.index(actor)
@@ -406,10 +421,10 @@ class ActorPoolManager:
 
             actor_id = self.actor_ids.get(idx)
             self.states[idx] = ActorState.RELEASED
-
             try:
                 ray.get(actor.reset.remote(), timeout=RPC_TIMEOUT)
             except Exception as e:
+                # Do NOT return a failed actor to idle: isolate it.
                 logger.error("Failed to reset actor %d: %s", idx, e)
                 self.states[idx] = ActorState.FAILED
                 if actor_id:
@@ -418,17 +433,40 @@ class ActorPoolManager:
                         timeout=RPC_TIMEOUT,
                     )
                 continue
-
             self.states[idx] = ActorState.IDLE
             if actor_id:
-                ray.get(
-                    self.registry.set_actor_state.remote(
-                        actor_id, ActorState.IDLE.value
-                    ),
-                    timeout=RPC_TIMEOUT,
-                )
+                reset_ok.append(actor_id)
 
-        logger.info("Released %d actors back to pool", len(actors))
+        # Only reset-clean actors are released; the registry re-validates the
+        # lease_identity so a stale release cannot free a re-leased actor.
+        if reset_ok:
+            ray.get(
+                self.registry.release_actors.remote(reset_ok, lease_id),
+                timeout=RPC_TIMEOUT,
+            )
+        self._leases.pop(lease_id, None)
+        logger.info("Released %d actors back to pool", len(reset_ok))
+
+    def _actor_ids_of(self, actors: list) -> list[str]:
+        """Map actor handles to their stable ids (skip unknown handles)."""
+        ids: list[str] = []
+        for actor in actors:
+            try:
+                idx = self.actors.index(actor)
+            except ValueError:
+                continue
+            actor_id = self.actor_ids.get(idx)
+            if actor_id:
+                ids.append(actor_id)
+        return ids
+
+    def _lease_id_for(self, actor_ids: list[str]) -> str | None:
+        """Return the lease id owning any of ``actor_ids``, or None."""
+        wanted = set(actor_ids)
+        for lease_id, ids in self._leases.items():
+            if wanted & set(ids):
+                return lease_id
+        return None
 
     # =============================================================== autoscale
     def set_autoscaler(
@@ -932,13 +970,13 @@ class ActorPoolManager:
         for idx, actor in enumerate(self.actors):
             actor_id = self.actor_ids.get(idx)
             try:
-                info = ray.get(actor.heartbeat.remote(), timeout=self.heartbeat_timeout)
+                ray.get(actor.heartbeat.remote(), timeout=self.heartbeat_timeout)
                 self._hb_failures[idx] = 0
+                # Liveness only: the registry heartbeat no longer mutates
+                # lease/state, so a busy actor keeps its leased status.
                 if actor_id and self.registry is not None:
                     ray.get(
-                        self.registry.heartbeat.remote(
-                            actor_id, info.get("state")
-                        ),
+                        self.registry.heartbeat.remote(actor_id),
                         timeout=self.heartbeat_timeout,
                     )
             except Exception as e:

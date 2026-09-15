@@ -934,18 +934,20 @@ class ExternalWorkerActor:
     
     def reset(self) -> None:
         """
-        Reset actor state.
-        
-        Releases model, KV Cache, distributed environment, but keeps device binding.
-        Actor returns to IDLE state and can be re-acquired.
+        Reset actor state (model / KV / distributed env freed; device kept).
+
+        Raises on cleanup failure: a worker that cannot be torn down cleanly is
+        left marked FAILED and never returned to IDLE, so the pool isolates it
+        instead of re-leasing a half-cleaned actor.
         """
         if self.worker is not None:
             try:
                 self.worker.shutdown()
-            except Exception:
-                pass
+            except Exception as e:
+                self.state = ActorState.FAILED
+                raise RuntimeError(f"Actor reset failed: {e}") from e
             self.worker = None
-        
+
         self.vllm_config = None
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
