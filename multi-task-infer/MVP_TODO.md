@@ -96,11 +96,13 @@
 
 ## 七、P1 量化脚本（已交付 `examples/benchmark_startup.py`，待真机运行）
 
-- 基线：`AsyncLLM.from_vllm_config` 冷启动（无池）→ 初始化 + 首次生成时延。
-- 池化：`ActorPoolManager.pre_start`（摊薄）+ `run_mvp` → 每模型运行时延。
-- 输出：init / prestart / run / first-gen / 端到端墙钟 + `speedup_e2e` 与
-  `speedup_run` 两个实测加速比；JSON 可选。未运行的加速一律标「待验证」，
-  不做未经验证的倍数声明。
+- 基线：`AsyncLLM.from_vllm_config` 冷启动（无池）→ 每个模型初始化 + 首次
+  生成时延求和。
+- 池化：`ActorPoolManager.pre_start` 一次（摊薄）+ `run_mvp` 每个模型复用同一
+  批 Actor → 每模型运行时延。
+- 输出：cold/run 分模型墙钟 + `speedup_e2e`（cold 总和 / 池化总和）与
+  `speedup_run`（cold 总和 / run 总和）两个实测加速比；JSON 可选。
+  未运行的加速一律标「待验证」，不做未经验证的倍数声明。
 
 ## 五、遗留注记（P2 热切换/展示一致性，非 MVP 路径）
 
