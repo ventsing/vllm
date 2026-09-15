@@ -256,10 +256,9 @@ class ExternalExecutor(RayExecutorV2):
             )
             self.ray_worker_handles.append(handle)
         
-        # Step 2: Group workers by node
-        self._group_workers_by_node()
-        
-        # Step 3: Create MessageQueue (same as RayExecutorV2)
+        # Step 2: Create MessageQueue (same as RayExecutorV2). Worker
+        # grouping by node happens inline in Step 4 (node_workers below) so
+        # local_rank reflects per-node ordering.
         import ray
         driver_node = ray.get_runtime_context().get_node_id()
         

@@ -130,3 +130,101 @@ def test_detect_dead_actors_uses_actor_heartbeat():
     assert reg.detect_dead_actors(timeout=30.0) == ["n0-g0"]
     # Node liveness is separate and still fresh.
     assert reg.detect_dead_nodes(timeout=30.0) == []
+
+
+# ----------------------------------------------------------------- lease logic
+def _by_id(reg):
+    return {a.actor_id: a for a in reg.list_actors()}
+
+
+def test_try_acquire_atomic_no_partial_lease():
+    """A shortfall leases nothing (no partial lease left behind)."""
+    reg = make_registry()
+
+    granted = reg.try_acquire(4, "l1")  # only 3 actors exist
+
+    assert granted == []
+    assert all(a.state == "idle" for a in reg.list_actors())
+
+
+def test_try_acquire_grants_and_bumps_generation():
+    """try_acquire marks selected actors leased and bumps their generation."""
+    reg = make_registry()
+
+    granted = reg.try_acquire(2, "l1")
+
+    assert sorted(granted) == ["n0-g0", "n1-g0"]  # spread across fault domains
+    regs = _by_id(reg)
+    assert regs["n0-g0"].state == "leased"
+    assert regs["n0-g0"].lease_id == "l1"
+    assert regs["n0-g0"].lease_generation == 1
+    # The unselected actor stays idle.
+    assert regs["n0-g1"].state == "idle"
+    assert regs["n0-g1"].lease_id is None
+
+
+def test_heartbeat_liveness_only_does_not_flip_lease():
+    """A heartbeat refreshing liveness never mutates lease/state."""
+    reg = make_registry()
+    reg.try_acquire(1, "l1")  # leases n0-g0
+
+    assert reg.heartbeat("n0-g0") is True
+
+    regs = _by_id(reg)
+    assert regs["n0-g0"].state == "leased"
+    assert regs["n0-g0"].lease_id == "l1"
+    assert regs["n0-g0"].lease_generation == 1
+
+
+def test_release_requires_matching_lease():
+    """Releasing with the wrong lease id leaves the actor leased."""
+    reg = make_registry()
+    reg.try_acquire(1, "l1")
+
+    released = reg.release_actors(["n0-g0"], "wrong-lease")
+
+    assert released == []
+    assert _by_id(reg)["n0-g0"].state == "leased"
+
+
+def test_stale_release_cannot_disturb_new_lease():
+    """A delayed release from task A cannot free an actor re-leased to B."""
+    reg = make_registry()
+    reg.try_acquire(1, "task-A")
+    reg.release_actors(["n0-g0"], "task-A")
+    reg.try_acquire(1, "task-B")  # n0-g0 is now leased to task-B
+
+    reg.release_actors(["n0-g0"], "task-A")  # stale duplicate from A
+
+    regs = _by_id(reg)
+    assert regs["n0-g0"].state == "leased"
+    assert regs["n0-g0"].lease_id == "task-B"
+    assert regs["n0-g0"].lease_generation == 2
+
+
+def test_duplicate_release_is_noop():
+    """Releasing an already-idle actor is a no-op."""
+    reg = make_registry()
+    reg.try_acquire(1, "l1")
+    reg.release_actors(["n0-g0"], "l1")
+
+    released_again = reg.release_actors(["n0-g0"], "l1")
+
+    assert released_again == []
+    assert _by_id(reg)["n0-g0"].state == "idle"
+
+
+def test_release_restores_free_gpu_count():
+    """Leasing and releasing move free_gpus in lockstep."""
+    reg = make_registry()
+    reg.try_acquire(2, "l1")
+    view = reg.get_global_view()
+    by_node = {n["node_id"]: n for n in view["nodes"]}
+    assert by_node["n0"]["free_gpus"] == 1  # 2 total, 1 leased
+    assert by_node["n1"]["free_gpus"] == 0  # 1 total, 1 leased
+
+    reg.release_actors(["n0-g0", "n1-g0"], "l1")
+    view = reg.get_global_view()
+    by_node = {n["node_id"]: n for n in view["nodes"]}
+    assert by_node["n0"]["free_gpus"] == 2
+    assert by_node["n1"]["free_gpus"] == 1

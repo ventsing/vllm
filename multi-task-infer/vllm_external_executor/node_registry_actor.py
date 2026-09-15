@@ -24,7 +24,11 @@ import threading
 import time
 from typing import Any
 
-from vllm_external_executor.cluster_state import ActorRegistration, NodeInfo
+from vllm_external_executor.cluster_state import (
+    ActorRegistration,
+    GlobalScheduler,
+    NodeInfo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,15 +122,19 @@ class NodeRegistryActor:
                 actor_id, node_id, device_id, fault_domain,
             )
 
-    def heartbeat(self, actor_id: str, state: str | None = None) -> bool:
-        """Record an actor heartbeat; returns False if the actor is unknown."""
+    def heartbeat(self, actor_id: str) -> bool:
+        """Record an actor heartbeat; returns False if the actor is unknown.
+
+        Liveness only: this never mutates ``state``/``lease_id``, so a
+        heartbeat from a busy actor cannot flip a leased actor back to idle
+        (or vice-versa). Lifecycle/lease changes go through
+        :meth:`try_acquire`, :meth:`release_actors`, or :meth:`set_actor_state`.
+        """
         with self._lock:
             reg = self._actors.get(actor_id)
             if reg is None:
                 return False
             reg.last_heartbeat = time.time()
-            if state is not None:
-                reg.state = state
             return True
 
     def set_actor_state(
@@ -147,6 +155,84 @@ class NodeRegistryActor:
             if state == "idle":
                 reg.lease_id = None
             self._sync_free_gpus(reg.node_id)
+
+    def try_acquire(
+        self,
+        world_size: int,
+        lease_id: str,
+        fault_domain_constraint: dict[str, int] | None = None,
+        prefer_driver_node: str | None = None,
+    ) -> list[str]:
+        """Atomically select and lease ``world_size`` idle actors.
+
+        Selection (via :class:`GlobalScheduler`) and the ``idle -> leased``
+        transition happen under one lock, so concurrent acquirers cannot grab
+        the same actor. On any shortfall or inconsistency nothing is leased.
+
+        Returns:
+            Leased actor ids, or ``[]`` when insufficient idle actors satisfy
+            the constraints (no partial lease is ever left behind).
+        """
+        with self._lock:
+            actors = list(self._actors.values())
+            nodes = list(self._nodes.values())
+            try:
+                selected = GlobalScheduler.select_actors(
+                    actors,
+                    nodes,
+                    world_size,
+                    fault_domain_constraint=fault_domain_constraint,
+                    prefer_driver_node=prefer_driver_node,
+                )
+            except (RuntimeError, ValueError):
+                return []
+
+            granted: list[str] = []
+            for actor_id in selected:
+                reg = self._actors.get(actor_id)
+                if reg is None or reg.state != "idle":
+                    # Defensive: the lock makes this unreachable in practice.
+                    self._rollback_lease(granted)
+                    return []
+                reg.state = "leased"
+                reg.lease_id = lease_id
+                reg.lease_generation += 1
+                granted.append(actor_id)
+
+            for node_id in {self._actors[a].node_id for a in granted}:
+                self._sync_free_gpus(node_id)
+            return granted
+
+    def release_actors(self, actor_ids: list[str], lease_id: str) -> list[str]:
+        """Release actors *owned by* ``lease_id``; return the ids released.
+
+        Actors whose current lease does not match (already re-leased to a new
+        task, or never leased) are left untouched. This makes a delayed or
+        duplicated release from an older task a no-op with respect to the new
+        task.
+        """
+        with self._lock:
+            released: list[str] = []
+            node_ids: set[str] = set()
+            for actor_id in actor_ids:
+                reg = self._actors.get(actor_id)
+                if reg is None or reg.lease_id != lease_id:
+                    continue
+                reg.state = "idle"
+                reg.lease_id = None
+                node_ids.add(reg.node_id)
+                released.append(actor_id)
+            for node_id in node_ids:
+                self._sync_free_gpus(node_id)
+            return released
+
+    def _rollback_lease(self, actor_ids: list[str]) -> None:
+        """Revert a partially-granted lease to idle (defensive)."""
+        for actor_id in actor_ids:
+            reg = self._actors.get(actor_id)
+            if reg is not None and reg.lease_id is not None:
+                reg.state = "idle"
+                reg.lease_id = None
 
     def unregister_actor(self, actor_id: str) -> None:
         """Remove an actor record (e.g. after rebuild)."""
