@@ -32,6 +32,7 @@
 | M8 | torch.compile 缓存共享 | `CacheManagerActor` | 1 节点 2 GPU |
 | M9 | 决策层接线（预取 + tiering + 记账） | `MigrationOrchestrator` | 1 节点 2 GPU |
 | M10 | LoRA 多任务共享 base（可选） | `WeightShareLedger` | 1 节点 1 GPU |
+| M11 | 弹性扩缩容（队列/P99/利用率） | `Autoscaler` + `maybe_autoscale` | 2 节点 |
 
 ## 逐项步骤
 
@@ -183,6 +184,26 @@ holder 集合与 cost ratio，切换 adapter 不重载 base。
 
 ---
 
+### M11 弹性扩缩容（队列/P99/利用率）
+
+**目的**：`ActorPoolManager.maybe_autoscale` 按负载快照动态创建/销毁 Actor，
+决策层（`Autoscaler`）输出正确的 target + reason，执行侧真正改变池大小。
+
+**通过标准**：
+1. 注入高队列/P99/利用率 → `maybe_autoscale` 返回 `SCALE_UP`，池新增
+   `scale_step` 个 IDLE Actor，且新 Actor 注册进 registry、可被 `acquire`。
+2. 三项负载都低 → `SCALE_DOWN`，尾部 IDLE Actor 被 `ray.kill` + 注销，池
+   index/`node_mapping` 保持一致（无飘移）。
+3. 冷却期内重复采样返回 `NONE`（无抖动）；时段窗口抬高 floor 或锚定
+   target 时按预期收敛。
+4. 超过 `pre_start` 的 placement-group bundle 上限时，注入的 `scale_up_fn`
+   接管（或按操作手册扩展 bundle）。
+
+**失败排查**：核对 `AutoscalingConfig` 水位 OR/AND 语义、`time_windows`
+跨午夜判定、`_scale_down_actors` 从尾部移除是否破坏 `_actor_id_to_idx`。
+
+---
+
 ## 汇总 checklist
 
 - [ ] M1 基础推理正确性
@@ -195,6 +216,7 @@ holder 集合与 cost ratio，切换 adapter 不重载 base。
 - [ ] M8 torch.compile 缓存共享
 - [ ] M9 决策层接线（预取 + tiering + 记账）
 - [ ] M10 LoRA 多任务共享 base（可选）
+- [ ] M11 弹性扩缩容（队列/P99/利用率）
 
 > 提交 PR 时，将勾选结果 + M5 实测带宽 + M3/M4 的 token 一致性截图贴进 PR
 > 的 **Model evaluation** 章节；未通过的项需在 PR 里说明阻塞原因。

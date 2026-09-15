@@ -102,6 +102,11 @@ class ActorPoolManager:
         from vllm_external_executor.migration import MigrationIdempotencyRegistry
         self._migration_registry = MigrationIdempotencyRegistry()
 
+        # Elastic autoscaling (decision layer + injected execution callbacks).
+        self.autoscaler = None  # vllm_external_executor.autoscaling.Autoscaler
+        self._scale_up_fn = None
+        self._scale_down_fn = None
+
     # ==================================================================== start
     def pre_start(
         self,
@@ -424,6 +429,166 @@ class ActorPoolManager:
                 )
 
         logger.info("Released %d actors back to pool", len(actors))
+
+    # =============================================================== autoscale
+    def set_autoscaler(
+        self,
+        config,
+        scale_up_fn=None,
+        scale_down_fn=None,
+    ) -> None:
+        """
+        Enable elastic autoscaling with the given policy config.
+
+        Args:
+            config: :class:`AutoscalerConfig` (watermarks, step, cooldowns,
+                time windows).
+            scale_up_fn: Optional ``fn(count)`` invoked on SCALE_UP; defaults
+                to :meth:`_scale_up_actors` (Ray create + register).
+            scale_down_fn: Optional ``fn(count)`` invoked on SCALE_DOWN;
+                defaults to :meth:`_scale_down_actors` (Ray kill + unregister).
+        """
+        from vllm_external_executor.autoscaling import Autoscaler
+        self.autoscaler = Autoscaler(config)
+        self._scale_up_fn = scale_up_fn
+        self._scale_down_fn = scale_down_fn
+
+    def maybe_autoscale(self, metrics, now=None):
+        """
+        Sample load and nudge the pool toward the autoscaler's target size.
+
+        Pure decision (in :class:`Autoscaler`) + execution side effects. When
+        no autoscaler is configured, this is a no-op returning ``None``.
+
+        Args:
+            metrics: :class:`LoadMetrics` snapshot (queue, P99, utilization).
+            now: Optional monotonic seconds (defaults to ``time.monotonic``).
+
+        Returns:
+            The :class:`AutoscaleDecision`, or ``None`` if disabled.
+        """
+        import time
+
+        from vllm_external_executor.autoscaling import AutoscaleAction
+
+        if self.autoscaler is None:
+            return None
+        now = now if now is not None else time.monotonic()
+        current = len(self.actors)
+        decision = self.autoscaler.decide(metrics, current, now)
+
+        up = self._scale_up_fn or self._scale_up_actors
+        down = self._scale_down_fn or self._scale_down_actors
+        if decision.action is AutoscaleAction.SCALE_UP:
+            up(decision.target_actors - current)
+        elif decision.action is AutoscaleAction.SCALE_DOWN:
+            down(current - decision.target_actors)
+
+        logger.info(
+            "Autoscale %s -> target=%d (reason=%s)",
+            decision.action.value, decision.target_actors, decision.reason,
+        )
+        return decision
+
+    def _scale_up_actors(self, count) -> None:
+        """Create and register ``count`` additional idle actors (Ray side).
+
+        New actors reuse the pool's recorded device layout (round-robin) and
+        are scheduled without a placement-group bundle index, since the group
+        was sized at ``pre_start``; extending the bundle set is a real-cluster
+        concern left to the operator (or an injected ``scale_up_fn``).
+        """
+        import ray
+
+        if count <= 0:
+            return
+        devices = [reg["device_id"] for reg in self._actor_regs.values()]
+        if not devices:
+            logger.warning("Cannot scale up: no device layout (pre_start first)")
+            return
+
+        for i in range(count):
+            device_id = devices[i % len(devices)]
+            actor = (
+                ray.remote(ExternalWorkerActor)
+                .options(num_gpus=1)
+                .remote(device_id=device_id, warmup_distributed=True)
+            )
+            ray.get(actor.wait_for_ready.remote(), timeout=RPC_TIMEOUT)
+            info = ray.get(actor.get_info.remote(), timeout=RPC_TIMEOUT)
+            node_id = info["node_id"]
+            domain = self.fault_domain or node_id
+            actor_id = f"{node_id}-g{device_id}-{uuid.uuid4().hex[:8]}"
+
+            ray.get(
+                actor.configure_pool_identity.remote(actor_id, domain),
+                timeout=RPC_TIMEOUT,
+            )
+            ray.get(
+                self.registry.register_actor.remote(
+                    actor_id=actor_id,
+                    node_id=node_id,
+                    device_id=device_id,
+                    fault_domain=domain,
+                ),
+                timeout=RPC_TIMEOUT,
+            )
+
+            idx = len(self.actors)
+            self.actors.append(actor)
+            self.states[idx] = ActorState.IDLE
+            self.actor_ids[idx] = actor_id
+            self._actor_id_to_idx[actor_id] = idx
+            self._actor_regs[actor_id] = {
+                "node_id": node_id,
+                "device_id": device_id,
+                "fault_domain": domain,
+                "warmup_distributed": True,
+            }
+            self.node_mapping.setdefault(node_id, []).append(idx)
+
+        logger.info("Scaled up: created %d actors", count)
+
+    def _scale_down_actors(self, count) -> None:
+        """Kill ``count`` surplus idle actors from the tail (Ray side).
+
+        Only IDLE actors are eligible; leased/failed actors are left alone.
+        Removing from the tail keeps the remaining pool indices stable (no
+        shift), so ``node_mapping``/``actor_ids`` stay consistent.
+        """
+        import ray
+
+        destroyed = 0
+        for idx in range(len(self.actors) - 1, -1, -1):
+            if destroyed >= count:
+                break
+            if self.states.get(idx) is not ActorState.IDLE:
+                continue
+            handle = self.actors[idx]
+            actor_id = self.actor_ids.get(idx)
+            try:
+                ray.kill(handle)
+            except Exception:
+                logger.warning("Failed to kill actor %d", idx)
+                continue
+            if actor_id:
+                try:
+                    ray.get(
+                        self.registry.unregister_actor.remote(actor_id),
+                        timeout=RPC_TIMEOUT,
+                    )
+                except Exception:
+                    pass
+                reg = self._actor_regs.pop(actor_id, None)
+                if reg:
+                    self.node_mapping.get(reg["node_id"], []).remove(idx)
+                self._actor_id_to_idx.pop(actor_id, None)
+                self.actor_ids.pop(idx, None)
+            self.actors.pop(idx)
+            self.states.pop(idx, None)
+            destroyed += 1
+
+        logger.info("Scaled down: destroyed %d idle actors", destroyed)
 
     # ========================================================== health / fault
     def get_global_view(self) -> dict:
