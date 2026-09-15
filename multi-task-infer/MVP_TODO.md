@@ -55,13 +55,13 @@
 - [x] 2.2 修复 `_group_workers_by_node()` 调用（删除死调用，分组已在 Step 4 内联）
 - [x] 2.3 初始化顺序（`create_dist_init_method(world_size)` 不再读 self.vllm_config）
 - [x] 2.4 `rpc_rank` / `all_kwargs` 对齐（传完整 per-rank `all_kwargs`，`rpc_rank=rank`）
-- [ ] 2.5 READY 语义（真机）
-- [ ] 2.6 `ResponseStatus` 对齐
-- [ ] 2.7 字符串/callable RPC（真机）
+- [x] 2.5 READY 语义（`wait_for_init` 仅 worker+response MQ 就绪才 READY）
+- [x] 2.6 `ResponseStatus` 对齐（响应用 `WorkerProc.ResponseStatus.SUCCESS/FAILURE`）
+- [x] 2.7 字符串/callable RPC（`_execute_worker_rpc` 支持 str + bytes/cloudpickle）
 - [x] 3.1 原子租约（`try_acquire` select+grant 合并，短缺无部分租用）
 - [x] 3.2 心跳不覆盖租约（`heartbeat` 仅 liveness，不动 state/lease）
 - [x] 3.3 lease 代次 + 过期释放隔离（`lease_generation` + `release_actors` 校验 lease_id）
-- [ ] 4.1 可停止执行循环（真机）
+- [x] 4.1 可停止执行循环（run 起后台 daemon 线程，`_stop_event` + dequeue timeout 可退出）
 - [x] 4.2 reset 失败隔离（reset 抛异常 + 标 FAILED；release 侧 reset 成功才归还）
 - [ ] 4.3 shutdown 不 kill / 幂等（真机）
 - [ ] 5.1 唯一 MVP 入口（真机）
