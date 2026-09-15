@@ -194,9 +194,10 @@ and a summary checkbox table for M1–M10) lives in
   switch).
 - Elastic autoscaling ships as a tested **decision layer** plus a wired
   `ActorPoolManager.maybe_autoscale`; the Ray create/kill execution side
-  (`_scale_up_actors`/`_scale_down_actors`) needs a real cluster, and growing
-  past the `pre_start` placement-group bundle count is an operator concern
-  (inject a custom `scale_up_fn` to handle it).
+  (`_scale_up_actors`/`_scale_down_actors`) needs a real cluster. The default
+  scale-up path schedules new actors without a placement group, so placement
+  is best-effort; operators needing PG affinity use Ray ≥ 2.24 `add_bundles`
+  or pre-reserve headroom (see `HARDWARE_VALIDATION.md` M11).
 
 ## Pre-submit checklist (maintainer must run)
 
