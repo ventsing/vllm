@@ -34,6 +34,12 @@ Environment::
     pip install -e ../  # installs vllm_external_executor entry point
 """
 
+# NOTE: This script predates the MVP convergence. Items 2-5 above (dynamic
+# TP/PP, compile-cache sharing, storage-backed loading, hot-switching) are P2
+# and its ``LLM(..., external_actors=..., cache_manager=...)`` kwargs are
+# outdated. For the supported single-node sequential-reuse path, see
+# examples/mvp_example.py (vllm_external_executor.mvp_entry.run_mvp).
+
 import argparse
 import logging
 import time

@@ -32,6 +32,12 @@ Architecture:
 └─────────────────────────────────────────────────────────────────┘
 """
 
+# NOTE: This example predates the MVP convergence and uses outdated
+# ``ExternalExecutor(model_config=...)`` / ``LLM(..., external_actors=...)``
+# kwargs, plus the P2 StorageCheckpointEngine / CacheManagerActor paths. For
+# the supported single-node sequential-reuse path, see examples/mvp_example.py
+# (which calls vllm_external_executor.mvp_entry.run_mvp).
+
 import ray
 from vllm import LLM, SamplingParams
 from vllm.config import ModelConfig
