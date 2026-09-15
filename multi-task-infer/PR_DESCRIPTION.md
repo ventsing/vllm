@@ -44,6 +44,15 @@ The plugin lives entirely under `multi-task-infer/` and hooks vLLM through the
 existing `vllm.general_plugins` entry point; core changes are intentionally
 minimal.
 
+> **Current status: MVP convergence.** The repository has been converged to a
+> **single-node sequential-reuse MVP** (see `multi-task-infer/MVP_TODO.md`).
+> The pooled-actor data path, atomic lease isolation, stoppable worker loop,
+> and the single `run_mvp` entry point are implemented and unit-tested
+> offline, **pending real-GPU validation**. Hot-switching, dynamic TP/PP,
+> KV migration, compile-cache sharing, storage loading, and autoscaling are
+> fenced off with explicit errors as P2 (see `MVP_TODO.md` section 8); their
+> code remains in tree for later enablement.
+
 ## Why this is not a duplicate
 
 - Existing vLLM executors (`RayExecutorV2`, `ExternalExecutor` variants in-tree)

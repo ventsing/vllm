@@ -24,6 +24,15 @@ vLLM 的 Executor 体系（UniProcExecutor、MultiprocExecutor、RayExecutorV2�
 | G6 | 编译缓存共享 | 通过 CacheManagerActor（独立 Ray Actor）跨节点共享 torch.compile 缓存，避免重复编译 |
 | G7 | 存储权重加载 | 通过 StorageCheckpointEngine 从持久化存储（NFS/Mooncake Store）加载模型权重 |
 
+### 0.2.1 当前实现状态（MVP 收敛）
+
+当前代码已收敛为**单节点顺序复用 MVP**（范围与逐项现状见 `MVP_TODO.md`）：
+
+- 已实现并进入真机验证：G1（Actor 池化）、G4（数据通路复用）、G5（最小侵入）。
+- 代码保留但已用显式报错门控（P2 延后）：G2（动态 TP/PP）、G3（模型热切换）、
+  G6（编译缓存共享）、G7（存储权重加载）；启用前需先修对应 bug，见
+  `MVP_TODO.md` 第八节。
+
 ## 0.3 术语定义
 
 | 术语 | 定义 |
