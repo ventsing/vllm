@@ -2,9 +2,10 @@
 
 ## 当前状态
 
-✅ 已完成并推送 `origin/feature/external-executor`（24 commits，HEAD `134e17976e`）：
+✅ 已完成并推送 `origin/feature/external-executor`：
 
-- 48 files changed（+13920 / −2，实时核对：`git diff --stat origin/main...HEAD`）
+- 48 files changed（+13952 / −2，实时核对：`git diff --stat origin/main...HEAD`）
+- 25 commits（实时核对：`git log --oneline origin/main..HEAD | wc -l`）
 - 核心 vLLM 修改仅 8 文件（+159 / −2，最小侵入）
 - 插件 `vllm_external_executor/` 17 个模块 + `tests/` 10 个测试模块
 - PR 描述 `PR_DESCRIPTION.md` + 真机验证清单 `HARDWARE_VALIDATION.md`
@@ -177,8 +178,8 @@ multi-task-infer/
 # 检查分支是否推送成功
 git branch -vv
 
-# 应该看到（HEAD hash 以实际为准，当前为 134e17976e）：
-# * feature/external-executor  134e17976e [origin/feature/external-executor] ...
+# 应该看到（HEAD hash 以 `git rev-parse --short HEAD` 为准）：
+# * feature/external-executor  <HEAD> [origin/feature/external-executor] ...
 
 # 检查远程分支
 git ls-remote origin feature/external-executor
