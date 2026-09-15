@@ -84,13 +84,13 @@
    （标记 FAILED + `mark_actor_failed`），不被再次分配。
 5. 启动收益量化：预热池 vs 冷启动 vLLM 的端到端时延对比（P1 第七节）。
 
-## 七、P1 量化脚本（待真机）
+## 七、P1 量化脚本（已交付 `examples/benchmark_startup.py`，待真机运行）
 
-- 基线：`AsyncLLM` 冷启动（无池）加载模型 → 首次生成时延。
-- 池化：预热池 + `run_mvp` 顺序两个模型 → 每模型首次生成时延。
-- 记录指标：acquire 耗时、`initialize_worker` 耗时、`load_model` 耗时、
-  首次生成时延、端到端墙钟；输出「预热池相对冷启动的加速比」为实测值，
-  未测的加速一律标注「待验证」，不做未经验证的倍数声明。
+- 基线：`AsyncLLM.from_vllm_config` 冷启动（无池）→ 初始化 + 首次生成时延。
+- 池化：`ActorPoolManager.pre_start`（摊薄）+ `run_mvp` → 每模型运行时延。
+- 输出：init / prestart / run / first-gen / 端到端墙钟 + `speedup_e2e` 与
+  `speedup_run` 两个实测加速比；JSON 可选。未运行的加速一律标「待验证」，
+  不做未经验证的倍数声明。
 
 ## 五、遗留注记（P2 热切换/展示一致性，非 MVP 路径）
 
