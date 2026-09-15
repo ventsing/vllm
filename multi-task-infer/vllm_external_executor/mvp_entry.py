@@ -132,6 +132,7 @@ def run_mvp(
         )
 
     actors = pool.acquire(tp_size=tp_size, pp_size=pp_size)
+    llm = None
     try:
         engine_args = AsyncEngineArgs(
             model=model,
@@ -167,6 +168,11 @@ def run_mvp(
 
         return asyncio.run(_generate())
     finally:
+        # llm.shutdown() tears down EngineCore, which calls
+        # ExternalExecutor.shutdown() (reset actors + close driver MQs) before
+        # the pool release path re-resets and returns the lease.
+        if llm is not None:
+            llm.shutdown()
         pool.release(actors)
         if own_pool:
             pool.shutdown()
