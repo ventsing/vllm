@@ -122,8 +122,55 @@ class ExternalExecutor(RayExecutorV2):
                     f"external_actors count ({len(external_actors)}) must equal "
                     f"world_size ({world_size})"
                 )
-        
+
+        # MVP envelope: reject out-of-scope configuration and shared
+        # decision-layer handles before they reach untested paths (P2).
+        self._validate_mvp_scope(vllm_config)
+        if cache_manager is not None:
+            raise NotImplementedError("MVP does not enable cache_manager (P2)")
+        optional_decision = (
+            prefix_index,
+            weight_ledger,
+            heat_tracker,
+            tiered_cache,
+            prefetch_policy,
+        )
+        if any(x is not None for x in optional_decision):
+            raise NotImplementedError(
+                "MVP does not enable shared decision-layer handles "
+                "(prefix_index/weight_ledger/heat_tracker/tiered_cache/"
+                "prefetch_policy) (P2)"
+            )
+
         super().__init__(vllm_config)
+
+    def _validate_mvp_scope(self, vllm_config: VllmConfig) -> None:
+        """Reject configurations outside the single-node sequential-reuse MVP.
+
+        Delegates to :func:`mvp_entry.validate_mvp_config` (single source of
+        truth for the MVP envelope) so the executor-level guard cannot drift
+        from the entry-point guard.
+
+        Raises:
+            ValueError: For TP/PP, LoRA, KV-connector, or elastic-EP settings
+                that the MVP does not implement yet (P2).
+        """
+        from vllm_external_executor.mvp_entry import validate_mvp_config
+
+        pc = vllm_config.parallel_config
+        lora = vllm_config.lora_config
+        ktc = vllm_config.kv_transfer_config
+        has_lora = lora is not None and getattr(lora, "max_loras", 0) > 0
+        has_kv_connector = (
+            ktc is not None and getattr(ktc, "kv_connector", None) is not None
+        )
+        validate_mvp_config(
+            tp_size=pc.tensor_parallel_size,
+            pp_size=pc.pipeline_parallel_size,
+            enable_lora=has_lora,
+            kv_transfer_config=ktc if has_kv_connector else None,
+            elastic_ep=getattr(pc, "enable_elastic_ep", False),
+        )
 
     def _init_decision_layer(
         self,
@@ -668,8 +715,19 @@ class ExternalExecutor(RayExecutorV2):
 
         Returns:
             MigrationStateMachine describing the terminal outcome.
+
+        Raises:
+            NotImplementedError: In-place hot-switching is a P2 feature and is
+                intentionally disabled in the MVP; use sequential reuse
+                (release actors, then acquire + ``initialize_worker`` for the
+                next model) instead.
         """
-        import ray
+        raise NotImplementedError(
+            "switch_model (in-place hot-switch) is disabled in the MVP (P2); "
+            "use sequential reuse: release actors then acquire and initialize "
+            "the next model"
+        )
+        import ray  # pragma: no cover - unreachable until P2 enables hot-switch
         import uuid
 
         from vllm_external_executor.migration import (
