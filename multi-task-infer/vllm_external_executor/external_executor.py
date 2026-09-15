@@ -634,6 +634,59 @@ class ExternalExecutor(RayExecutorV2):
         self.ray_worker_handles = []
         logger.info("Actors released")
 
+    def start_worker_monitor(self, inline=False) -> None:
+        """Monitor pre-started actor liveness via heartbeat polling.
+
+        Overrides :meth:`RayExecutorV2.start_worker_monitor`: our
+        ``ExternalWorkerActor.run`` returns immediately (its busy loop runs on
+        a daemon thread), so the inherited ``run_ref`` sentinel would complete
+        at once and be misread as a worker death. Poll each actor's
+        ``heartbeat`` instead; a failed poll marks the executor failed and
+        shuts it down.
+        """
+        import ray
+        import threading
+        import time
+
+        if not self.ray_worker_handles:
+            raise RuntimeError("Ray workers have not started successfully.")
+
+        self_ref = weakref.ref(self)
+        handles = list(self.ray_worker_handles)
+
+        def _should_stop() -> bool:
+            executor = self_ref()
+            return not executor or executor.shutting_down
+
+        def monitor_workers() -> None:
+            while not _should_stop() and ray.is_initialized():
+                try:
+                    ray.get([h.actor.heartbeat.remote() for h in handles])
+                except Exception:
+                    if _should_stop():
+                        return
+                    executor = self_ref()
+                    if not executor:
+                        return
+                    executor.is_failed = True
+                    logger.error(
+                        "ExternalWorkerActor heartbeat failed, shutting down "
+                        "executor."
+                    )
+                    executor.shutdown()
+                    if executor.failure_callback is not None:
+                        callback = executor.failure_callback
+                        executor.failure_callback = None
+                        callback()
+                    return
+                time.sleep(5.0)
+
+        thread = threading.Thread(
+            target=monitor_workers, daemon=True, name="ExternalWorkerMonitor"
+        )
+        thread.start()
+        self._monitor_thread = thread
+
     def shutdown(self) -> None:
         """Tear down the executor without killing pool-owned actors.
 
