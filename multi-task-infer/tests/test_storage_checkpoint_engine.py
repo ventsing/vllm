@@ -32,8 +32,10 @@ from pathlib import Path
 
 import torch
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Expose the plugin package root (multi-task-infer/) so `vllm_external_executor`
+# is importable even when the plugin is not pip-installed; conftest.py does the
+# same during pytest collection.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vllm_external_executor.storage_checkpoint_engine import (
     CheckpointMetadata,
