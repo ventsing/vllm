@@ -979,7 +979,9 @@ class ExternalWorkerActor:
             if self._loop_thread is not None:
                 self._loop_thread.join(timeout=10.0)
                 if self._loop_thread.is_alive():
-                    raise RuntimeError("Worker loop did not stop; refusing to free resources")
+                    raise RuntimeError(
+                        "Worker loop did not stop; refusing to free resources"
+                    )
                 self._loop_thread = None
             self._release_worker_resources()
         except Exception as e:
@@ -988,6 +990,7 @@ class ExternalWorkerActor:
         self.state = ActorState.IDLE
 
     def _release_worker_resources(self) -> None:
+        import gc
         import logging
 
         from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
@@ -1007,6 +1010,23 @@ class ExternalWorkerActor:
                 device_module.memory_reserved(),
             )
 
+        # Drop model/KV/workspace references up front. Some platform workers
+        # (e.g. Ascend NPU) do not run GPUWorker.shutdown's model-runner
+        # teardown, so the weights and KV cache would otherwise stay referenced
+        # across a reuse and starve the next engine.
+        inner = getattr(self.worker, "worker", None)
+        model_runner = getattr(inner, "model_runner", None)
+        if model_runner is not None:
+            model_runner.model = None
+            if hasattr(model_runner, "kv_caches"):
+                model_runner.kv_caches.clear()
+            try:
+                from vllm.v1.worker.workspace import reset_workspace_manager
+
+                reset_workspace_manager()
+            except Exception:  # pragma: no cover - best effort
+                pass
+
         if self.worker is not None:
             self.worker.shutdown()
             self.worker = None
@@ -1024,6 +1044,7 @@ class ExternalWorkerActor:
         # release global process groups and collect frozen/cyclic model objects.
         cleanup_dist_env_and_memory(shutdown_ray=False)
         if device_module is not None:
+            gc.collect()
             device_module.empty_cache()
             free, total = device_module.mem_get_info()
             logger.info(
