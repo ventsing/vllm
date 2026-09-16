@@ -16,6 +16,7 @@ import sys
 import time
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -33,17 +34,18 @@ def _load_module(name, path):
 # Register a stub package so `from vllm_external_executor.cluster_state import`
 # inside node_registry_actor.py resolves to a module loaded directly from disk
 # (bypassing vllm_external_executor/__init__.py, which imports torch).
-sys.modules.setdefault(
-    "vllm_external_executor", types.ModuleType("vllm_external_executor")
-)
-_load_module(
-    "vllm_external_executor.cluster_state",
-    _EXEC_DIR / "cluster_state.py",
-)
-registry_mod = _load_module(
-    "vllm_external_executor.node_registry_actor",
-    _EXEC_DIR / "node_registry_actor.py",
-)
+with patch.dict(sys.modules):
+    sys.modules.setdefault(
+        "vllm_external_executor", types.ModuleType("vllm_external_executor")
+    )
+    _load_module(
+        "vllm_external_executor.cluster_state",
+        _EXEC_DIR / "cluster_state.py",
+    )
+    registry_mod = _load_module(
+        "vllm_external_executor.node_registry_actor",
+        _EXEC_DIR / "node_registry_actor.py",
+    )
 
 NodeRegistryActor = registry_mod.NodeRegistryActor
 

@@ -420,7 +420,12 @@ class ExternalExecutor(RayExecutorV2):
         self.start_worker_monitor()
         
         self.output_rank = self._get_output_rank()
-        
+
+        # Initialize on the MQ thread that will execute inference. Each RPC
+        # runs on all ranks concurrently, as required by distributed init.
+        self.collective_rpc("init_device")
+        self.collective_rpc("load_model")
+
         logger.info("ExternalExecutor initialization complete")
     
     def _handle_compilation_optimization(self):

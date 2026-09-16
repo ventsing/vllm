@@ -113,8 +113,6 @@ class ExternalWorkerActor:
         """Import common libraries to speed up subsequent initialization."""
         import torch.distributed as dist
         import vllm
-        from vllm.v1.worker.gpu_worker import Worker
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
         from vllm.v1.worker.worker_base import WorkerWrapperBase
         from vllm.distributed.device_communicators.shm_broadcast import (
             MessageQueue, Handle
@@ -128,6 +126,7 @@ class ExternalWorkerActor:
         NCCL/HCCl library is already loaded and initialized.
         """
         import torch.distributed as dist
+        from vllm.platforms import current_platform
         
         try:
             # Create a temporary TCPStore
@@ -141,8 +140,8 @@ class ExternalWorkerActor:
             
             # Initialize process group
             dist.init_process_group(
-                backend="nccl",
-                init_method=f"tcp://localhost:{store.port}",
+                backend=current_platform.dist_backend,
+                store=store,
                 world_size=1,
                 rank=0,
             )
@@ -156,7 +155,7 @@ class ExternalWorkerActor:
         except Exception as e:
             # Warmup is optional, don't fail if it doesn't work
             import logging
-            logging.warning(f"NCCL warmup failed: {e}")
+            logging.warning(f"Distributed warmup failed: {e}")
     
     def wait_for_ready(self) -> dict:
         """
@@ -961,47 +960,81 @@ class ExternalWorkerActor:
             result = func(*args, **kwargs)
 
             if output_rank is None or self._rank == output_rank:
-                self.worker_response_mq.enqueue(
-                    (WorkerProc.ResponseStatus.SUCCESS, result)
-                )
+                WorkerProc.enqueue_output(self, result)
         except Exception as e:
             if hasattr(e, "add_note"):
                 import traceback
                 e.add_note(traceback.format_exc())
             logger.exception("Worker RPC failed: %s", method)
             if output_rank is None or self._rank == output_rank:
-                self.worker_response_mq.enqueue(
-                    (WorkerProc.ResponseStatus.FAILURE, str(e))
-                )
+                WorkerProc.enqueue_output(self, e)
     
     def reset(self) -> None:
-        """
-        Reset actor state (model / KV / distributed env freed; device kept).
-
-        Raises on cleanup failure: a worker that cannot be torn down cleanly is
-        left marked FAILED and never returned to IDLE, so the pool isolates it
-        instead of re-leasing a half-cleaned actor.
-        """
-        # Stop the busy loop before tearing down the worker/MQs it touches.
+        """Stop execution and release task resources before returning to IDLE."""
+        if self.state == ActorState.FAILED:
+            raise RuntimeError("Failed actor must be rebuilt before reuse")
+        self.state = ActorState.RELEASED
         self._stop_event.set()
-        if self._loop_thread is not None and self._loop_thread.is_alive():
-            self._loop_thread.join(timeout=1.0)
-        self._loop_thread = None
+        try:
+            if self._loop_thread is not None:
+                self._loop_thread.join(timeout=10.0)
+                if self._loop_thread.is_alive():
+                    raise RuntimeError("Worker loop did not stop; refusing to free resources")
+                self._loop_thread = None
+            self._release_worker_resources()
+        except Exception as e:
+            self.state = ActorState.FAILED
+            raise RuntimeError(f"Actor reset failed: {e}") from e
+        self.state = ActorState.IDLE
+
+    def _release_worker_resources(self) -> None:
+        import logging
+
+        from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+        from vllm.platforms import current_platform
+
+        logger = logging.getLogger(__name__)
+        device = getattr(self.worker, "device", None) if self.worker else None
+        device_module = None
+        if device is not None:
+            current_platform.set_device(device)
+            device_module = getattr(torch, current_platform.device_type)
+            device_module.synchronize()
+            logger.info(
+                "Actor %s before reset: allocated=%d reserved=%d bytes",
+                self.actor_id,
+                device_module.memory_allocated(),
+                device_module.memory_reserved(),
+            )
 
         if self.worker is not None:
-            try:
-                self.worker.shutdown()
-            except Exception as e:
-                self.state = ActorState.FAILED
-                raise RuntimeError(f"Actor reset failed: {e}") from e
+            self.worker.shutdown()
             self.worker = None
-
         self.vllm_config = None
+        for mq in (self.rpc_broadcast_mq, self.worker_response_mq):
+            if mq is not None:
+                mq.shutdown()
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
         self._dist_init_store = None
-        self.state = ActorState.IDLE
-    
+        self._active_checkpoint_path = None
+        self._active_storage_config = None
+
+        # Ordinary workers exit their process. Pooled workers must explicitly
+        # release global process groups and collect frozen/cyclic model objects.
+        cleanup_dist_env_and_memory(shutdown_ray=False)
+        if device_module is not None:
+            device_module.empty_cache()
+            free, total = device_module.mem_get_info()
+            logger.info(
+                "Actor %s after reset: allocated=%d reserved=%d free=%d total=%d bytes",
+                self.actor_id,
+                device_module.memory_allocated(),
+                device_module.memory_reserved(),
+                free,
+                total,
+            )
+
     def shutdown(self) -> None:
         """Shutdown the actor completely."""
         self.reset()

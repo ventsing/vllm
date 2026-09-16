@@ -264,6 +264,8 @@ class NFSStorageBackend(StorageBackend):
     
     def load_tensor(self, tensor_meta: TensorMeta) -> torch.Tensor:
         """Load a single tensor from NFS."""
+        import os
+
         from safetensors import safe_open
         
         model_path = os.path.join(
@@ -296,6 +298,7 @@ class NFSStorageBackend(StorageBackend):
     
     def delete(self, checkpoint_path: str) -> None:
         """Delete checkpoint from NFS."""
+        import os
         import shutil
         checkpoint_dir = self._get_checkpoint_dir(checkpoint_path)
         if os.path.exists(checkpoint_dir):

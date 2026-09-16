@@ -140,3 +140,19 @@ def test_constraint_exceeds_domain_raises():
 def test_zero_world_size_raises():
     with pytest.raises(ValueError):
         GlobalScheduler.select_actors([], [], world_size=0)
+
+
+@pytest.mark.parametrize(
+    "device_key, expected",
+    [
+        ("GPU", {"num_cpus": 0, "num_gpus": 1}),
+        ("NPU", {"num_cpus": 0, "num_gpus": 0, "resources": {"NPU": 1}}),
+    ],
+)
+def test_actor_reserves_only_the_platform_accelerator(device_key, expected):
+    assert cluster_state.actor_resource_kwargs(device_key) == expected
+
+
+def test_actor_rejects_platform_without_ray_resource():
+    with pytest.raises(ValueError, match="Ray device resource"):
+        cluster_state.actor_resource_kwargs("")

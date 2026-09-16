@@ -14,6 +14,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -28,26 +29,27 @@ def _load_module(name, filename):
     return mod
 
 
-sys.modules.setdefault(
-    "vllm_external_executor", types.ModuleType("vllm_external_executor")
-)
-migration = _load_module("vllm_external_executor.migration", "migration.py")
-storage_tier = _load_module(
-    "vllm_external_executor.storage_tier", "storage_tier.py"
-)
-prefetch = _load_module(
-    "vllm_external_executor.prefetch_policy", "prefetch_policy.py"
-)
-prefix_mod = _load_module(
-    "vllm_external_executor.global_prefix_index", "global_prefix_index.py"
-)
-weight_mod = _load_module(
-    "vllm_external_executor.weight_sharing", "weight_sharing.py"
-)
-orch = _load_module(
-    "vllm_external_executor.migration_orchestrator",
-    "migration_orchestrator.py",
-)
+with patch.dict(sys.modules):
+    sys.modules.setdefault(
+        "vllm_external_executor", types.ModuleType("vllm_external_executor")
+    )
+    migration = _load_module("vllm_external_executor.migration", "migration.py")
+    storage_tier = _load_module(
+        "vllm_external_executor.storage_tier", "storage_tier.py"
+    )
+    prefetch = _load_module(
+        "vllm_external_executor.prefetch_policy", "prefetch_policy.py"
+    )
+    prefix_mod = _load_module(
+        "vllm_external_executor.global_prefix_index", "global_prefix_index.py"
+    )
+    weight_mod = _load_module(
+        "vllm_external_executor.weight_sharing", "weight_sharing.py"
+    )
+    orch = _load_module(
+        "vllm_external_executor.migration_orchestrator",
+        "migration_orchestrator.py",
+    )
 
 StorageTier = storage_tier.StorageTier
 TieredCache = storage_tier.TieredCache

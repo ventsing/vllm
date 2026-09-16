@@ -19,8 +19,8 @@ PROMPTS = [
 # Phase 1 (TP=1) / phase 2 (TP=2): switch tp_size to 2 once TP=2 is validated.
 TP_SIZE = 1
 MODELS = [
-    "facebook/opt-125m",
-    "facebook/opt-350m",
+    "/opt/huawei/dataset/downloaded_models/Qwen3.5-4B",
+    "/opt/huawei/dataset/downloaded_models/Qwen3.5-4B",
 ]
 
 

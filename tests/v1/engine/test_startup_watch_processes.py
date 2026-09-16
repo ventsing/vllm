@@ -195,3 +195,47 @@ def test_wait_for_engine_startup_reports_watched_process_exit():
         exc_info.value
     )
     assert "Failed frontend proc(s): {'RustFrontend': 1}" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("connected", [False, True])
+def test_external_actor_handles_deserialize_after_ray_connect(monkeypatch, connected):
+    """A spawned engine must join Ray before unpickling pooled actor handles."""
+    import sys
+
+    events = []
+    actors = [object()]
+
+    def init(**kwargs):
+        nonlocal connected
+        assert kwargs == {"address": "cluster:6925", "namespace": "pool"}
+        connected = True
+        events.append("connect")
+
+    def loads(payload):
+        assert connected
+        assert payload == b"actor-handles"
+        events.append("deserialize")
+        return actors
+
+    def run(**kwargs):
+        assert kwargs == {"external_actors": actors, "dp_rank": 0}
+        events.append("run")
+
+    expected = ([] if connected else ["connect"]) + ["deserialize", "run"]
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        SimpleNamespace(
+            is_initialized=lambda: connected,
+            init=init,
+            cloudpickle=SimpleNamespace(loads=loads),
+        ),
+    )
+    monkeypatch.setattr(EngineCoreProc, "run_engine_core", run)
+    engine_utils._run_engine_core_with_external_actors(
+        external_actors_payload=b"actor-handles",
+        ray_address="cluster:6925",
+        ray_namespace="pool",
+        dp_rank=0,
+    )
+    assert events == expected

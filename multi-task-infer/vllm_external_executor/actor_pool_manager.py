@@ -21,6 +21,9 @@ import threading
 import uuid
 from typing import TYPE_CHECKING
 
+from vllm.platforms import current_platform
+
+from vllm_external_executor.cluster_state import actor_resource_kwargs
 from vllm_external_executor.external_worker_actor import ActorState, ExternalWorkerActor
 
 if TYPE_CHECKING:
@@ -169,6 +172,9 @@ class ActorPoolManager:
             num_actors, devices_per_node, strategy,
         )
 
+        device_key = current_platform.ray_device_key
+        resource_kwargs = actor_resource_kwargs(device_key)
+
         # 1. Cache manager actor.
         from vllm_external_executor.cache_manager_actor import (
             create_cache_manager_actor,
@@ -189,7 +195,7 @@ class ActorPoolManager:
         # 3. Placement group.
         if placement_group is None:
             self.placement_group = ray.util.placement_group(
-                bundles=[{"GPU": 1}] * num_actors + [{"CPU": 1}],
+                bundles=[{device_key: 1}] * num_actors + [{"CPU": 1}],
                 strategy="PACK" if strategy == "pack" else "SPREAD",
             )
             ray.get(self.placement_group.ready(), timeout=RPC_TIMEOUT)
@@ -205,7 +211,7 @@ class ActorPoolManager:
             actor = (
                 ray.remote(ExternalWorkerActor)
                 .options(
-                    num_gpus=1,
+                    **resource_kwargs,
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=self.placement_group,
                         placement_group_bundle_index=i,
@@ -549,7 +555,7 @@ class ActorPoolManager:
             device_id = devices[i % len(devices)]
             actor = (
                 ray.remote(ExternalWorkerActor)
-                .options(num_gpus=1)
+                .options(**actor_resource_kwargs(current_platform.ray_device_key))
                 .remote(device_id=device_id, warmup_distributed=True)
             )
             ray.get(actor.wait_for_ready.remote(), timeout=RPC_TIMEOUT)
@@ -725,7 +731,7 @@ class ActorPoolManager:
             self.states[old_idx] = ActorState.FAILED
 
         try:
-            options = {"num_gpus": 1}
+            options = actor_resource_kwargs(current_platform.ray_device_key)
             if target_node_id:
                 options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
                     node_id=target_node_id, soft=False
@@ -841,7 +847,7 @@ class ActorPoolManager:
 
             # Build the replacement on the target node (build-before-swap).
             sm.transition(MigrationPhase.UNLOAD)
-            options = {"num_gpus": 1}
+            options = actor_resource_kwargs(current_platform.ray_device_key)
             if target_node_id:
                 options["scheduling_strategy"] = (
                     NodeAffinitySchedulingStrategy(

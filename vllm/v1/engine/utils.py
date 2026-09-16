@@ -141,6 +141,25 @@ def _node_ip_from_resources(node_resources: dict) -> str | None:
     return None
 
 
+def _run_engine_core_with_external_actors(
+    *,
+    external_actors_payload: bytes,
+    ray_address: str,
+    ray_namespace: str,
+    **kwargs,
+) -> None:
+    """Connect to the actor pool cluster before deserializing its handles."""
+    import ray
+    from ray import cloudpickle
+
+    from vllm.v1.engine.core import EngineCoreProc
+
+    if not ray.is_initialized():
+        ray.init(address=ray_address, namespace=ray_namespace)
+    external_actors = cloudpickle.loads(external_actors_payload)
+    EngineCoreProc.run_engine_core(external_actors=external_actors, **kwargs)
+
+
 class CoreEngineProcManager:
     """
     Utility class to handle creation, readiness, and shutdown
@@ -180,6 +199,22 @@ class CoreEngineProcManager:
 
         from vllm.v1.engine.core import EngineCoreProc
 
+        process_target = EngineCoreProc.run_engine_core
+        if external_actors is not None:
+            import ray
+            from ray import cloudpickle
+
+            if not ray.is_initialized():
+                raise RuntimeError("The actor pool must be connected to Ray")
+            runtime_context = ray.get_runtime_context()
+            common_kwargs.pop("external_actors")
+            common_kwargs.update(
+                external_actors_payload=cloudpickle.dumps(external_actors),
+                ray_address=runtime_context.gcs_address,
+                ray_namespace=runtime_context.namespace,
+            )
+            process_target = _run_engine_core_with_external_actors
+
         self.processes: list[BaseProcess] = []
         local_dp_ranks = []
         for index in range(local_engine_count):
@@ -190,7 +225,7 @@ class CoreEngineProcManager:
             local_dp_ranks.append(local_index)
             self.processes.append(
                 context.Process(
-                    target=EngineCoreProc.run_engine_core,
+                    target=process_target,
                     name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
                     kwargs=common_kwargs
                     | {"dp_rank": global_index, "local_dp_rank": local_index},

@@ -274,3 +274,12 @@ class GlobalScheduler:
             taken[best] += 1
 
         return selected
+
+
+def actor_resource_kwargs(device_key: str) -> dict:
+    """Reserve one platform accelerator for a Ray worker actor."""
+    if not device_key:
+        raise ValueError("The current platform does not define a Ray device resource")
+    if device_key == "GPU":
+        return {"num_cpus": 0, "num_gpus": 1}
+    return {"num_cpus": 0, "num_gpus": 0, "resources": {device_key: 1}}

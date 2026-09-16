@@ -10,7 +10,6 @@ run_mvp, so the constraint checker is importable and testable in isolation.
 
 import importlib.util
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -26,13 +25,8 @@ def _load_module(name, path):
     return mod
 
 
-# Register a stub package so mvp_entry's lazy imports resolve only when run_mvp
-# is actually called (never in these tests).
-sys.modules.setdefault(
-    "vllm_external_executor", types.ModuleType("vllm_external_executor")
-)
 mvp = _load_module(
-    "vllm_external_executor.mvp_entry",
+    "mvp_entry_under_test",
     _EXEC_DIR / "mvp_entry.py",
 )
 

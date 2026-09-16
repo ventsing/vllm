@@ -86,9 +86,10 @@ def test_heat_tracker_decays_old_access():
     heat = AccessHeatTracker(decay=0.5)
     heat.record("k", 1.0)
     heat.record("k", 2.0)
-    assert heat.score("k", 2.0) == pytest.approx(2.0)
+    # The first access decays to 0.5 before the second adds 1.0.
+    assert heat.score("k", 2.0) == pytest.approx(1.5)
     # One time-step of decay halves the score.
-    assert heat.score("k", 3.0) == pytest.approx(1.0)
+    assert heat.score("k", 3.0) == pytest.approx(0.75)
 
 
 def test_prefetch_ranks_hot_and_respects_budget():
