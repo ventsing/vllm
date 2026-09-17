@@ -57,3 +57,67 @@ def test_unsupported_config_raises(kwargs, message):
     """Every out-of-envelope flag is rejected with a clear error."""
     with pytest.raises(ValueError, match=message):
         mvp.validate_mvp_config(**kwargs)
+
+
+@pytest.mark.parametrize("shutdown_fails", [False, True])
+@pytest.mark.parametrize("own_pool", [False, True])
+def test_cleanup_waits_for_engine_and_returns_actors_even_on_shutdown_error(
+    monkeypatch, shutdown_fails, own_pool
+):
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import Mock
+
+    events = []
+    actors = [object()]
+    pool = SimpleNamespace(
+        pre_start=Mock(),
+        acquire=Mock(return_value=actors),
+        release=Mock(side_effect=lambda actors: events.append("release")),
+        shutdown=Mock(side_effect=lambda: events.append("pool shutdown")),
+    )
+
+    class EngineArgs:
+        def __init__(self, **kwargs):
+            assert "cleanup_timeout" not in kwargs
+
+        def create_engine_config(self):
+            return object()
+
+    class LLM:
+        def __init__(self, **kwargs):
+            pass
+
+        def shutdown(self, timeout):
+            events.append(("engine shutdown", timeout))
+            if shutdown_fails:
+                raise RuntimeError("shutdown failed")
+
+    modules = {
+        "vllm": {"SamplingParams": lambda **kwargs: object()},
+        "vllm.engine": {},
+        "vllm.engine.arg_utils": {"AsyncEngineArgs": EngineArgs},
+        "vllm.v1": {},
+        "vllm.v1.engine": {},
+        "vllm.v1.engine.async_llm": {"AsyncLLM": LLM},
+        "vllm_external_executor": {
+            "ActorPoolManager": lambda: pool,
+            "ExternalExecutor": object(),
+        },
+    }
+    for name, attrs in modules.items():
+        module = ModuleType(name)
+        module.__path__ = []
+        vars(module).update(attrs)
+        monkeypatch.setitem(sys.modules, name, module)
+
+    kwargs = {"pool": None if own_pool else pool, "cleanup_timeout": 60.0}
+    if shutdown_fails:
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            mvp.run_mvp("test-model", [], **kwargs)
+    else:
+        assert mvp.run_mvp("test-model", [], **kwargs) == []
+    expected = [("engine shutdown", 60.0), "release"]
+    if own_pool:
+        expected.append("pool shutdown")
+    assert events == expected
+    pool.release.assert_called_once_with(actors)

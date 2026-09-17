@@ -946,6 +946,12 @@ class ActorPoolManager:
             self._hb_stop.wait(self.heartbeat_interval)
 
     def _heartbeat_round(self, ray) -> None:
+        # A registry RPC can also queue behind lifecycle work in the same
+        # Ray process. Defer the whole probe while any actor is leased or
+        # being reset; the next idle round will refresh all timestamps.
+        if any(state is not ActorState.IDLE for state in self.states.values()):
+            return
+
         # Node-level first: refresh node liveness, auto-recover dead nodes.
         # recover_node rebuilds the dead node's actors in place, so the
         # actor-level pass below then probes the replacement handles and does
@@ -974,6 +980,14 @@ class ActorPoolManager:
 
     def _heartbeat_actors(self, ray) -> None:
         for idx, actor in enumerate(self.actors):
+            # Ray actors execute methods serially by default. A leased actor
+            # may spend tens of seconds loading a model or tearing down an
+            # engine, so its heartbeat RPC would sit behind that operation
+            # and be reported as a false failure. Node heartbeats continue to
+            # cover process/node liveness while the actor is in use.
+            if self.states.get(idx) is not ActorState.IDLE:
+                self._hb_failures[idx] = 0
+                continue
             actor_id = self.actor_ids.get(idx)
             try:
                 ray.get(actor.heartbeat.remote(), timeout=self.heartbeat_timeout)

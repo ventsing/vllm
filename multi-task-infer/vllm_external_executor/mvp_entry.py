@@ -68,6 +68,7 @@ def run_mvp(
     devices: list[int] | None = None,
     pool: object | None = None,
     pool_size: int | None = None,
+    cleanup_timeout: float = 60.0,
     warmup_distributed: bool = True,
     enable_lora: bool = False,
     kv_transfer_config: object | None = None,
@@ -94,6 +95,7 @@ def run_mvp(
             shut down on return). When None, a pool is created and shut down
             after use.
         pool_size: Number of actors to pre-start; defaults to tp_size.
+        cleanup_timeout: Seconds to wait for EngineCore resource teardown.
         warmup_distributed: Whether to warm up NCCL/HCCl at actor creation.
         engine_kwargs: Extra ``AsyncEngineArgs`` keyword arguments.
 
@@ -117,7 +119,6 @@ def run_mvp(
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
-
     from vllm_external_executor import ActorPoolManager, ExternalExecutor
 
     own_pool = pool is None
@@ -168,11 +169,12 @@ def run_mvp(
 
         return asyncio.run(_generate())
     finally:
-        # llm.shutdown() tears down EngineCore, which calls
-        # ExternalExecutor.shutdown() (reset actors + close driver MQs) before
-        # the pool release path re-resets and returns the lease.
-        if llm is not None:
-            llm.shutdown()
-        pool.release(actors)
-        if own_pool:
-            pool.shutdown()
+        try:
+            if llm is not None:
+                llm.shutdown(timeout=cleanup_timeout)
+        finally:
+            try:
+                pool.release(actors)
+            finally:
+                if own_pool:
+                    pool.shutdown()

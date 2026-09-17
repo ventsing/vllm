@@ -651,17 +651,18 @@ class ExternalExecutor(RayExecutorV2):
         """
         import ray
         import threading
-        import time
 
         if not self.ray_worker_handles:
             raise RuntimeError("Ray workers have not started successfully.")
 
         self_ref = weakref.ref(self)
         handles = list(self.ray_worker_handles)
+        stop_event = threading.Event()
+        self._monitor_stop_event = stop_event
 
         def _should_stop() -> bool:
             executor = self_ref()
-            return not executor or executor.shutting_down
+            return stop_event.is_set() or not executor or executor.shutting_down
 
         def monitor_workers() -> None:
             while not _should_stop() and ray.is_initialized():
@@ -684,7 +685,7 @@ class ExternalExecutor(RayExecutorV2):
                         executor.failure_callback = None
                         callback()
                     return
-                time.sleep(5.0)
+                stop_event.wait(5.0)
 
         thread = threading.Thread(
             target=monitor_workers, daemon=True, name="ExternalWorkerMonitor"
@@ -712,6 +713,8 @@ class ExternalExecutor(RayExecutorV2):
                 return
             self.shutting_down = True
 
+        if stop_event := getattr(self, "_monitor_stop_event", None):
+            stop_event.set()
         self._join_monitor_thread()
 
         for handle in getattr(self, "ray_worker_handles", []):

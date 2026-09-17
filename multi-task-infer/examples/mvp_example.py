@@ -6,8 +6,9 @@ actors in ``finally``; the *same* actors then serve the next model without a
 new pool or actor creation.
 """
 
-import ray
+import argparse
 
+import ray
 from vllm_external_executor import ActorPoolManager
 from vllm_external_executor.mvp_entry import run_mvp
 
@@ -25,6 +26,15 @@ MODELS = [
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", action="append", help="Repeat to alternate models")
+    parser.add_argument("--rounds", type=int, help="Number of sequential runs")
+    parser.add_argument("--enforce-eager", action="store_true")
+    args = parser.parse_args()
+    models = args.model or MODELS
+    rounds = len(models) if args.rounds is None else args.rounds
+    if rounds < 1:
+        parser.error("--rounds must be positive")
     ray.init()
 
     # One pre-started pool serves every model in sequence.
@@ -35,9 +45,16 @@ def main() -> None:
         warmup_distributed=True,
     )
     try:
-        for model in MODELS:
-            outputs = run_mvp(model, PROMPTS, tp_size=TP_SIZE, pool=pool)
-            print(f"=== {model} (TP={TP_SIZE}) ===")
+        for index in range(rounds):
+            model = models[index % len(models)]
+            outputs = run_mvp(
+                model,
+                PROMPTS,
+                tp_size=TP_SIZE,
+                pool=pool,
+                enforce_eager=args.enforce_eager,
+            )
+            print(f"=== round {index + 1}/{rounds}: {model} (TP={TP_SIZE}) ===")
             for prompt, text in zip(PROMPTS, outputs):
                 print(f"  {prompt!r} -> {text!r}")
     finally:

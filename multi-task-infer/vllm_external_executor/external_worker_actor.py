@@ -991,12 +991,13 @@ class ExternalWorkerActor:
 
     def _release_worker_resources(self) -> None:
         import gc
-        import logging
 
         from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+        from vllm.logger import init_logger
         from vllm.platforms import current_platform
 
-        logger = logging.getLogger(__name__)
+        logger = init_logger("vllm.external_worker_actor")
+        cleanup_refs = self._capture_cleanup_refs()
         device = getattr(self.worker, "device", None) if self.worker else None
         device_module = None
         if device is not None:
@@ -1010,27 +1011,35 @@ class ExternalWorkerActor:
                 device_module.memory_reserved(),
             )
 
-        # Drop model/KV/workspace references up front. Some platform workers
-        # (e.g. Ascend NPU) do not run GPUWorker.shutdown's model-runner
-        # teardown, so the weights and KV cache would otherwise stay referenced
-        # across a reuse and starve the next engine.
-        inner = getattr(self.worker, "worker", None)
-        model_runner = getattr(inner, "model_runner", None)
-        if model_runner is not None:
-            model_runner.model = None
-            if hasattr(model_runner, "kv_caches"):
-                model_runner.kv_caches.clear()
-            try:
-                from vllm.v1.worker.workspace import reset_workspace_manager
+        if current_platform.device_type == "npu":
+            self._release_ascend_graph_resources()
 
-                reset_workspace_manager()
-            except Exception:  # pragma: no cover - best effort
-                pass
+        # AOT ownership is only discoverable while the model is still intact.
+        self._release_compiled_functions(logger)
 
         if self.worker is not None:
             self.worker.shutdown()
-            self.worker = None
+
+        # Some platform workers leave runner teardown to process exit. Pooled
+        # actors also need to drop layers retained by the compilation context.
+        inner = getattr(self.worker, "worker", None)
+        model_runner = getattr(inner, "model_runner", None)
+        if model_runner is not None:
+            from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
+            from vllm.v1.worker.workspace import reset_workspace_manager
+
+            model_runner.compilation_config.static_forward_context.clear()
+            model_runner.model = None
+            if hasattr(model_runner, "kv_caches"):
+                model_runner.kv_caches.clear()
+            _ROPE_DICT.clear()
+            reset_workspace_manager()
+            inner.model_runner = None
+
+        self.worker = None
         self.vllm_config = None
+        # Local references must be gone before GC and device cache eviction.
+        del model_runner, inner
         for mq in (self.rpc_broadcast_mq, self.worker_response_mq):
             if mq is not None:
                 mq.shutdown()
@@ -1055,6 +1064,224 @@ class ExternalWorkerActor:
                 free,
                 total,
             )
+            if device_module.memory_allocated() > 1024**3:
+                self._log_cleanup_referrers(cleanup_refs, logger)
+                try:
+                    self._log_allocator_diagnostics(device_module, device, logger)
+                except Exception:
+                    logger.exception("Actor %s allocator diagnostics failed", self.actor_id)
+
+    def _log_allocator_diagnostics(self, device_module, device, logger) -> None:
+        """Compare allocator blocks with GC-visible tensor storage after reset."""
+        import gc
+        import weakref
+        from collections import Counter
+
+        device_module.synchronize()
+        gc.collect()
+        device_module.empty_cache()
+        stats = device_module.memory_stats()
+        logger.warning(
+            "Actor %s after drain: allocated=%d active=%d reserved=%d bytes",
+            self.actor_id,
+            stats.get("allocated_bytes.all.current", 0),
+            stats.get("active_bytes.all.current", 0),
+            stats.get("reserved_bytes.all.current", 0),
+        )
+        blocks = Counter()
+        for segment in device_module.memory_snapshot():
+            if segment.get("device") != device_module.current_device():
+                continue
+            for block in segment["blocks"]:
+                blocks[block["state"]] += block["size"]
+        logger.warning(
+            "Actor %s allocator block bytes: %s", self.actor_id, dict(blocks)
+        )
+
+        storages = {}
+        samples = {}
+        skipped = 0
+        for obj in gc.get_objects():
+            if not isinstance(obj, torch.Tensor) or obj.device != device:
+                continue
+            try:
+                storage = obj.untyped_storage()
+                address = storage.data_ptr()
+                storages[address] = storage.nbytes()
+                samples[address] = weakref.ref(obj)
+                del storage
+            except (RuntimeError, NotImplementedError):
+                skipped += 1
+        del obj
+        logger.warning(
+            "Actor %s GC-visible tensor storage: count=%d bytes=%d skipped=%d "
+            "(lower bound; excludes tensors not tracked by Python GC)",
+            self.actor_id,
+            len(storages),
+            sum(storages.values()),
+            skipped,
+        )
+        largest = sorted(storages, key=storages.get, reverse=True)[:3]
+        self._log_cleanup_referrers(
+            {
+                f"live_storage[{addr:#x}] bytes={storages[addr]}": samples[addr]
+                for addr in largest
+            },
+            logger,
+        )
+
+    def _capture_cleanup_refs(self) -> dict:
+        """Track old resources without extending their lifetime during reset."""
+        import weakref
+        from contextlib import suppress
+
+        refs = {}
+
+        def track(name, obj):
+            if obj is not None:
+                with suppress(TypeError):
+                    refs[name] = weakref.ref(obj)
+
+        inner = getattr(self.worker, "worker", None)
+        runner = getattr(inner, "model_runner", None)
+        model = getattr(runner, "model", None)
+        track("worker", inner)
+        track("runner", runner)
+        track("model", model)
+        parameters = getattr(model, "parameters", None)
+        if callable(parameters):
+            track("first_parameter", next(parameters(), None))
+        caches = getattr(runner, "kv_caches", ())
+        for index, cache in enumerate(caches):
+            if index >= 2:
+                break
+            if isinstance(cache, (list, tuple)):
+                cache = next(iter(cache), None)
+            track(f"kv_cache[{index}]", cache)
+        return refs
+
+    def _log_cleanup_referrers(self, refs: dict, logger) -> None:
+        """Log bounded ownership paths, without tensor contents or model values."""
+        import gc
+        import types
+
+        seen = set()
+        remaining = 64
+        excluded = {id(refs)}
+
+        def visit(obj, path, depth):
+            nonlocal remaining
+            if depth == 0 or id(obj) in seen or remaining == 0:
+                return
+            seen.add(id(obj))
+            owners = gc.get_referrers(obj)
+            excluded.add(id(owners))
+            for owner in owners:
+                if id(owner) in excluded:
+                    continue
+                if remaining == 0:
+                    break
+                kind = f"{type(owner).__module__}.{type(owner).__qualname__}"
+                if isinstance(owner, dict):
+                    keys = [
+                        key[:80] for key, value in owner.items()
+                        if value is obj and isinstance(key, str)
+                    ][:8]
+                    kind += f" keys={keys}"
+                    if isinstance(owner.get("__name__"), str):
+                        kind += f" module={owner['__name__']}"
+                elif isinstance(owner, types.FrameType):
+                    kind += f" function={owner.f_code.co_name}"
+                elif isinstance(owner, types.MethodType):
+                    kind += f" method={owner.__func__.__qualname__}"
+                elif isinstance(owner, types.FunctionType):
+                    kind += f" function={owner.__module__}.{owner.__qualname__}"
+                remaining -= 1
+                logger.warning("Actor %s retained: %s <- %s", self.actor_id, path, kind)
+                visit(owner, f"{path} <- {kind}", depth - 1)
+
+        for name, ref in refs.items():
+            remaining = 64
+            seen.clear()
+            obj = ref()
+            logger.warning(
+                "Actor %s after reset: %s alive=%s",
+                self.actor_id, name, obj is not None,
+            )
+            if obj is not None:
+                visit(obj, name, 10)
+
+    def _release_compiled_functions(self, logger) -> None:
+        """Release AOT artifacts through the model that owns their callables."""
+        inner = getattr(self.worker, "worker", None)
+        runner = getattr(inner, "model_runner", None)
+        model = getattr(runner, "model", None)
+        if model is None:
+            return
+        modules = getattr(model, "modules", None)
+        layers = modules() if callable(modules) else (model,)
+        released = removed = hooks_removed = 0
+        for layer in layers:
+            # Dynamo's global hook registry owns this bound method even when
+            # the outer model and its AOT artifacts have been released.
+            handle = getattr(layer, "_bytecode_hook_handle", None)
+            if handle is not None:
+                handle.remove()
+                layer._bytecode_hook_handle = None
+                hooks_removed += 1
+            aot = getattr(layer, "aot_compiled_fn", None)
+            artifacts = getattr(aot, "_artifacts", None)
+            if artifacts is None:
+                continue
+            fn = getattr(aot, "fn", None)
+            namespace = getattr(fn, "__globals__", None)
+            backend_id = artifacts.backend_id
+            # PyTorch creates a private globals copy for FunctionType. Its
+            # __name__ matches the model module, but sys.modules cannot find it.
+            if (
+                isinstance(namespace, dict)
+                and backend_id in namespace
+                and namespace[backend_id] is artifacts.compiled_fn
+            ):
+                del namespace[backend_id]
+                removed += 1
+            # Guards and artifacts can retain submodules independently of the
+            # outer model. Break those links before collecting Python cycles.
+            artifacts.guard_manager = None
+            artifacts.compiled_fn = None
+            layer.aot_compiled_fn = None
+            released += 1
+        logger.info(
+            "Actor %s released %d AOT artifacts; removed %d private-global "
+            "callables and %d bytecode hooks",
+            self.actor_id,
+            released,
+            removed,
+            hooks_removed,
+        )
+
+    def _release_ascend_graph_resources(self) -> None:
+        """Release process-global graph state before reusing an Ascend actor."""
+        import sys
+
+        # Do not import the backend during cleanup of a partially started actor.
+        acl_graph = sys.modules.get("vllm_ascend.compilation.acl_graph")
+        if acl_graph is not None:
+            for wrapper in list(getattr(acl_graph, "_acl_graph_wrappers", ())):
+                wrapper.concrete_aclgraph_entries.clear()
+            for name in (
+                "_graph_params", "_draft_graph_params", "_draft_graph_prefill_params"
+            ):
+                params = getattr(acl_graph, name, None)
+                if params is not None:
+                    params.attn_params.clear()
+                    params.handles.clear()
+                    params.events.clear()
+                    params.workspaces.clear()
+                    setattr(acl_graph, name, None)
+
+        # Compiled callables can retain graph wrappers beyond runner lifetime.
+        torch._dynamo.reset()
 
     def shutdown(self) -> None:
         """Shutdown the actor completely."""

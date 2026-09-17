@@ -118,3 +118,241 @@ def test_reset_only_returns_to_idle_after_successful_cleanup(cleanup_fails):
         actor.reset()
         assert actor.state == _module.ActorState.IDLE
     actor._release_worker_resources.assert_called_once()
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_reset_collects_runner_and_layer_cache_before_device_cache_eviction(
+    monkeypatch,
+    device_type,
+):
+    """A pooled worker must release cyclic runners and config-owned KV caches."""
+    import gc
+    import weakref
+    from threading import Event
+    from unittest.mock import Mock
+
+    from vllm.distributed import parallel_state
+    from vllm.platforms import current_platform
+    from vllm.v1.worker import workspace
+
+    class Resource:
+        def bytecode_hook(self, *args):
+            pass
+
+    config = SimpleNamespace(static_forward_context={})
+    runner = Resource()
+    runner.compilation_config = config
+    runner.model = Resource()
+    hooks = {0: runner.model.bytecode_hook, 1: object()}
+    runner.model._bytecode_hook_handle = SimpleNamespace(
+        remove=lambda: hooks.pop(0, None)
+    )
+    runner.kv_caches = [Resource()]
+    config.static_forward_context["attention"] = runner.kv_caches[0]
+    runner.cycle = runner
+    refs = [weakref.ref(obj) for obj in (runner, runner.model, runner.kv_caches[0])]
+
+    class Worker:
+        device = "test-device"
+
+        def __init__(self, model_runner):
+            self.model_runner = model_runner
+
+        def shutdown(self):
+            assert self.model_runner.model is not None
+            self.model_runner.model = None
+
+    actor = object.__new__(_module.ExternalWorkerActor)
+    actor.actor_id = "test-actor"
+    actor.state = _module.ActorState.RUNNING
+    actor._stop_event = Event()
+    actor._loop_thread = None
+    actor.worker = SimpleNamespace(worker=Worker(runner), device="test-device")
+    actor.worker.shutdown = actor.worker.worker.shutdown
+    actor.vllm_config = config
+    actor.rpc_broadcast_mq = actor.worker_response_mq = None
+    import sys
+    from types import FunctionType, ModuleType
+
+    class SerializableFunction(SimpleNamespace):
+        pass
+
+    # PyTorch AOT constructs a private globals copy, not the module dictionary.
+    model_module = ModuleType("pooled_test_model")
+    globals_copy = dict(vars(model_module))
+    owned = SerializableFunction(
+        example_inputs=[runner.model, runner.kv_caches[0]],
+    )
+    globals_copy["__compiled_fn_owned"] = owned
+    foreign = object()
+    globals_copy["__compiled_fn_foreign"] = foreign
+    model_module.__compiled_fn_owned = foreign
+    artifacts = SimpleNamespace(
+        backend_id="__compiled_fn_owned",
+        compiled_fn=owned,
+        guard_manager=SimpleNamespace(model=runner.model),
+    )
+    runner.model.aot_compiled_fn = SimpleNamespace(
+        fn=FunctionType((lambda: None).__code__, globals_copy),
+        _artifacts=artifacts,
+    )
+    del owned
+    monkeypatch.setitem(sys.modules, model_module.__name__, model_module)
+    if device_type == "npu":
+        graph_module = ModuleType("vllm_ascend.compilation.acl_graph")
+        wrapper = SimpleNamespace(concrete_aclgraph_entries={1: runner.model})
+        graph_module._acl_graph_wrappers = [wrapper]
+        for name in (
+            "_graph_params",
+            "_draft_graph_params",
+            "_draft_graph_prefill_params",
+        ):
+            setattr(
+                graph_module,
+                name,
+                SimpleNamespace(
+                    attn_params={1: list(runner.kv_caches)},
+                    handles={},
+                    events={},
+                    workspaces={},
+                ),
+            )
+        compiled = [runner]
+        monkeypatch.setitem(sys.modules, graph_module.__name__, graph_module)
+        monkeypatch.setattr(
+            _module.torch, "_dynamo", SimpleNamespace(reset=compiled.clear)
+        )
+    del runner
+
+    def evict_cache():
+        assert all(ref() is None for ref in refs)
+
+    device_module = SimpleNamespace(
+        synchronize=Mock(),
+        memory_allocated=lambda: 0,
+        memory_reserved=lambda: 0,
+        empty_cache=Mock(side_effect=evict_cache),
+        mem_get_info=lambda: (100, 100),
+    )
+    monkeypatch.setattr(current_platform, "device_type", device_type)
+    monkeypatch.setattr(current_platform, "set_device", lambda device: None)
+    monkeypatch.setattr(_module.torch, device_type, device_module, raising=False)
+    monkeypatch.setattr(
+        parallel_state, "cleanup_dist_env_and_memory", lambda **kwargs: gc.collect()
+    )
+    monkeypatch.setattr(workspace, "reset_workspace_manager", lambda: None)
+
+    actor.reset()
+
+    assert actor.state == _module.ActorState.IDLE
+    assert config.static_forward_context == {}
+    assert set(hooks) == {1}
+    assert "__compiled_fn_owned" not in globals_copy
+    assert globals_copy["__compiled_fn_foreign"] is foreign
+    assert model_module.__compiled_fn_owned is foreign
+    assert artifacts.compiled_fn is None
+    assert artifacts.guard_manager is None
+    device_module.empty_cache.assert_called_once()
+    if device_type == "npu":
+        assert graph_module._graph_params is None
+        assert graph_module._draft_graph_params is None
+        assert graph_module._draft_graph_prefill_params is None
+        assert wrapper.concrete_aclgraph_entries == {}
+    actor.reset()
+    assert actor.state == _module.ActorState.IDLE
+
+
+def test_reset_diagnostics_identify_holder_without_keeping_model_alive():
+    import gc
+    import weakref
+    from unittest.mock import Mock
+
+    class Model:
+        pass
+
+    actor = object.__new__(_module.ExternalWorkerActor)
+    actor.actor_id = "diagnostic-test"
+    actor.worker = SimpleNamespace(
+        worker=SimpleNamespace(model_runner=SimpleNamespace(model=Model()))
+    )
+    held = {"retained_model": actor.worker.worker.model_runner.model}
+    model_ref = weakref.ref(held["retained_model"])
+    refs = actor._capture_cleanup_refs()
+    actor.worker = None
+    logger = Mock()
+
+    actor._log_cleanup_referrers(refs, logger)
+
+    assert any("retained_model" in str(call) for call in logger.warning.call_args_list)
+    assert len(logger.warning.call_args_list) <= 65
+    held.clear()
+    gc.collect()
+    assert model_ref() is None
+
+
+def test_reset_allocator_diagnostics_count_shared_storage_once(monkeypatch):
+    import gc
+    from unittest.mock import Mock
+
+    storage = SimpleNamespace(data_ptr=lambda: 4096, nbytes=lambda: 8192)
+
+    class Tensor:
+        device = "npu:0"
+
+        def untyped_storage(self):
+            return storage
+
+    tensors = [Tensor(), Tensor()]
+    monkeypatch.setattr(_module.torch, "Tensor", Tensor, raising=False)
+    monkeypatch.setattr(gc, "get_objects", lambda: tensors)
+    actor = object.__new__(_module.ExternalWorkerActor)
+    actor.actor_id = "storage-test"
+    actor._log_cleanup_referrers = Mock()
+    device = SimpleNamespace(
+        synchronize=Mock(),
+        empty_cache=Mock(),
+        memory_stats=lambda: {},
+        current_device=lambda: 0,
+        memory_snapshot=lambda: [
+            {"device": 0, "blocks": [{"state": "active_allocated", "size": 8192}]},
+            {"device": 1, "blocks": [{"state": "active_allocated", "size": 9999}]},
+        ],
+    )
+    logger = Mock()
+
+    actor._log_allocator_diagnostics(device, "npu:0", logger)
+
+    assert logger.warning.call_args_list[1].args[-1] == {"active_allocated": 8192}
+    assert logger.warning.call_args_list[2].args[2:5] == (1, 8192, 0)
+    assert len(actor._log_cleanup_referrers.call_args.args[0]) == 1
+
+
+def test_reset_removes_nested_compile_hook_without_aot():
+    import gc
+    import weakref
+    from unittest.mock import Mock
+
+    class Layer:
+        def bytecode_hook(self, *args):
+            pass
+
+    layer = Layer()
+    hooks = {0: layer.bytecode_hook, 1: object()}
+    layer._bytecode_hook_handle = SimpleNamespace(remove=lambda: hooks.pop(0, None))
+    ref = weakref.ref(layer)
+    model = SimpleNamespace()
+    model.modules = lambda model=model, layer=layer: iter((model, layer))
+    actor = object.__new__(_module.ExternalWorkerActor)
+    actor.actor_id = "non-aot-test"
+    actor.worker = SimpleNamespace(
+        worker=SimpleNamespace(model_runner=SimpleNamespace(model=model))
+    )
+
+    actor._release_compiled_functions(Mock())
+
+    assert set(hooks) == {1}
+    assert layer._bytecode_hook_handle is None
+    actor.worker = None
+    del model, layer
+    gc.collect()
+    assert ref() is None
