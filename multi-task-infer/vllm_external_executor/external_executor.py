@@ -723,12 +723,14 @@ class ExternalExecutor(RayExecutorV2):
             except Exception:
                 logger.exception("Failed to reset actor rank=%d", handle.rank)
 
+        from vllm_external_executor.mq_cleanup import close_message_queue
+
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
-            rpc_broadcast_mq.shutdown()
+            close_message_queue(rpc_broadcast_mq)
             self.rpc_broadcast_mq = None
 
         for mq in getattr(self, "response_mqs", []):
-            mq.shutdown()
+            close_message_queue(mq)
         self.response_mqs = []
         self.ray_worker_handles = []
 

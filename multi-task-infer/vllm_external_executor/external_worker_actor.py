@@ -996,6 +996,8 @@ class ExternalWorkerActor:
         from vllm.logger import init_logger
         from vllm.platforms import current_platform
 
+        from vllm_external_executor.mq_cleanup import close_message_queue
+
         logger = init_logger("vllm.external_worker_actor")
         cleanup_refs = self._capture_cleanup_refs()
         device = getattr(self.worker, "device", None) if self.worker else None
@@ -1042,7 +1044,7 @@ class ExternalWorkerActor:
         del model_runner, inner
         for mq in (self.rpc_broadcast_mq, self.worker_response_mq):
             if mq is not None:
-                mq.shutdown()
+                close_message_queue(mq)
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
         self._dist_init_store = None
@@ -1069,7 +1071,9 @@ class ExternalWorkerActor:
                 try:
                     self._log_allocator_diagnostics(device_module, device, logger)
                 except Exception:
-                    logger.exception("Actor %s allocator diagnostics failed", self.actor_id)
+                    logger.exception(
+                        "Actor %s allocator diagnostics failed", self.actor_id
+                    )
 
     def _log_allocator_diagnostics(self, device_module, device, logger) -> None:
         """Compare allocator blocks with GC-visible tensor storage after reset."""
