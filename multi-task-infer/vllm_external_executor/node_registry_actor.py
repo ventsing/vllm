@@ -45,6 +45,9 @@ class NodeRegistryActor:
         self._nodes: dict[str, NodeInfo] = {}
         self._actors: dict[str, ActorRegistration] = {}
         self._node_actors: dict[str, set[str]] = {}
+        # actor_id -> Ray ActorHandle, so a second process can attach to an
+        # existing pool and drive acquire/release without re-creating actors.
+        self._handles: dict[str, Any] = {}
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ nodes
@@ -105,8 +108,18 @@ class NodeRegistryActor:
         node_id: str,
         device_id: int,
         fault_domain: str | None = None,
+        handle: Any = None,
     ) -> None:
-        """Register or refresh an actor record."""
+        """Register or refresh an actor record.
+
+        Args:
+            actor_id: Stable actor id.
+            node_id: Ray node id hosting the actor.
+            device_id: Physical device index bound by the actor.
+            fault_domain: Inherited from the hosting node when omitted.
+            handle: Optional Ray ActorHandle. Stored so other processes can
+                attach to the pool and drive acquire/release.
+        """
         with self._lock:
             node = self._nodes.get(node_id)
             fault_domain = fault_domain or (node.fault_domain if node else node_id)
@@ -117,6 +130,8 @@ class NodeRegistryActor:
                 fault_domain=fault_domain,
             )
             self._node_actors.setdefault(node_id, set()).add(actor_id)
+            if handle is not None:
+                self._handles[actor_id] = handle
             logger.info(
                 "Registered actor %s (node=%s device=%d domain=%s)",
                 actor_id, node_id, device_id, fault_domain,
@@ -238,6 +253,7 @@ class NodeRegistryActor:
         """Remove an actor record (e.g. after rebuild)."""
         with self._lock:
             reg = self._actors.pop(actor_id, None)
+            self._handles.pop(actor_id, None)
             if reg is not None:
                 actors = self._node_actors.get(reg.node_id)
                 if actors is not None:
@@ -252,6 +268,15 @@ class NodeRegistryActor:
     def list_actors(self) -> list[ActorRegistration]:
         with self._lock:
             return list(self._actors.values())
+
+    def get_actor_handles(self) -> dict[str, Any]:
+        """Return ``{actor_id: ActorHandle}`` for every registered actor.
+
+        Actor handles are picklable, so a second process can pull this map and
+        drive the pool (acquire/release/reset) without owning the pre-start.
+        """
+        with self._lock:
+            return dict(self._handles)
 
     def get_global_view(self) -> dict[str, Any]:
         """Unified cross-node resource snapshot.
@@ -323,6 +348,7 @@ class NodeRegistryActor:
             actor_ids = sorted(self._node_actors.pop(node_id, ()))
             for actor_id in actor_ids:
                 self._actors.pop(actor_id, None)
+                self._handles.pop(actor_id, None)
             self._nodes.pop(node_id, None)
             logger.warning("Marked node %s failed (%d actors)", node_id, len(actor_ids))
             return actor_ids
@@ -331,6 +357,7 @@ class NodeRegistryActor:
         """Remove a single failed actor from the registry."""
         with self._lock:
             reg = self._actors.pop(actor_id, None)
+            self._handles.pop(actor_id, None)
             if reg is not None:
                 actors = self._node_actors.get(reg.node_id)
                 if actors is not None:

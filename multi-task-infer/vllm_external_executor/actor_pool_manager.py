@@ -39,6 +39,9 @@ DEFAULT_HEARTBEAT_TIMEOUT = 30.0
 # flap, but a node is only declared dead when its *node* heartbeat stalls.
 DEFAULT_NODE_HEARTBEAT_TIMEOUT = 60.0
 MAX_HEARTBEAT_FAILURES = 3
+# Name of the detached registry actor; a second process attaches with
+# ray.get_actor(REGISTRY_ACTOR_NAME) to share a pre-started pool.
+REGISTRY_ACTOR_NAME = "external-executor-node-registry"
 
 
 class ActorPoolManager:
@@ -282,6 +285,7 @@ class ActorPoolManager:
                     node_id=node_id,
                     device_id=device_id,
                     fault_domain=domain,
+                    handle=self.actors[i],
                 ),
                 timeout=RPC_TIMEOUT,
             )
@@ -299,6 +303,79 @@ class ActorPoolManager:
         logger.info(
             "Actor pool ready: %d actors on %d nodes",
             num_actors, len(self.node_mapping),
+        )
+
+    # ================================================================== attach
+    def attach(
+        self,
+        registry=None,
+        registry_name: str = REGISTRY_ACTOR_NAME,
+    ) -> None:
+        """Attach to a pre-started pool owned by another process.
+
+        Rebuilds the local actor index from the central registry (which stores
+        both the registrations and their Ray handles) so this process can call
+        :meth:`acquire` / :meth:`release` against the same actors without
+        re-running :meth:`pre_start`. Liveness heartbeats stay with the owning
+        process; an attached client only schedules work and releases it.
+
+        Args:
+            registry: Optional registry handle; resolved by name when omitted.
+            registry_name: Name of the detached registry actor.
+
+        Raises:
+            RuntimeError: If the registry holds no actors (the owner has not
+                finished ``pre_start`` yet, or already shut down).
+        """
+        import ray
+
+        if registry is None:
+            registry = ray.get_actor(registry_name)
+        self.registry = registry
+
+        regs = ray.get(registry.list_actors.remote(), timeout=RPC_TIMEOUT)
+        handles = ray.get(
+            registry.get_actor_handles.remote(), timeout=RPC_TIMEOUT
+        )
+        if not regs or not handles:
+            raise RuntimeError(
+                "Registry has no actors to attach to; run pre_start first"
+            )
+
+        # Deterministic local indices: sort by actor_id so every attached
+        # process lands on the same (index -> actor_id) map as the owner.
+        regs = sorted(regs, key=lambda r: r.actor_id)
+        self.actors = []
+        self.actor_ids = {}
+        self._actor_id_to_idx = {}
+        self._actor_regs = {}
+        self.states = {}
+        self.node_mapping = {}
+        for i, reg in enumerate(regs):
+            handle = handles.get(reg.actor_id)
+            if handle is None:
+                logger.warning(
+                    "Actor %s has no stored handle; skipped", reg.actor_id
+                )
+                continue
+            self.actors.append(handle)
+            self.actor_ids[i] = reg.actor_id
+            self._actor_id_to_idx[reg.actor_id] = i
+            self._actor_regs[reg.actor_id] = {
+                "node_id": reg.node_id,
+                "device_id": reg.device_id,
+                "fault_domain": reg.fault_domain,
+            }
+            try:
+                self.states[i] = ActorState(reg.state)
+            except ValueError:
+                self.states[i] = ActorState.IDLE
+            self.node_mapping.setdefault(reg.node_id, []).append(i)
+
+        self._initialized = True
+        logger.info(
+            "Attached to pool: %d actors across %d nodes",
+            len(self.actors), len(self.node_mapping),
         )
 
     def _collect_node_addresses(self) -> dict[str, str]:
@@ -574,6 +651,7 @@ class ActorPoolManager:
                     node_id=node_id,
                     device_id=device_id,
                     fault_domain=domain,
+                    handle=actor,
                 ),
                 timeout=RPC_TIMEOUT,
             )
@@ -757,6 +835,7 @@ class ActorPoolManager:
                     node_id=new_node_id,
                     device_id=reg["device_id"],
                     fault_domain=domain,
+                    handle=new_actor,
                 ),
                 timeout=RPC_TIMEOUT,
             )
@@ -876,6 +955,7 @@ class ActorPoolManager:
                     node_id=new_node_id,
                     device_id=reg["device_id"],
                     fault_domain=domain,
+                    handle=new_actor,
                 ),
                 timeout=RPC_TIMEOUT,
             )
@@ -974,7 +1054,24 @@ class ActorPoolManager:
             )
             self.recover_node(node_id)
 
+    def _registry_idle_actor_ids(self, ray) -> set[str] | None:
+        """Return ids the registry reports idle, or None if unavailable."""
+        if self.registry is None:
+            return None
+        try:
+            regs = ray.get(
+                self.registry.list_actors.remote(),
+                timeout=self.heartbeat_timeout,
+            )
+        except Exception:
+            return None
+        return {reg.actor_id for reg in regs if reg.state == "idle"}
+
     def _heartbeat_actors(self, ray) -> None:
+        # Another process may lease actors without touching this process's
+        # local states, so probe only actors the registry reports idle
+        # (authoritative), falling back to local state when unavailable.
+        idle_ids = self._registry_idle_actor_ids(ray)
         for idx, actor in enumerate(self.actors):
             # Ray actors execute methods serially by default. A leased actor
             # may spend tens of seconds loading a model or tearing down an
@@ -985,6 +1082,9 @@ class ActorPoolManager:
                 self._hb_failures[idx] = 0
                 continue
             actor_id = self.actor_ids.get(idx)
+            if idle_ids is not None and actor_id not in idle_ids:
+                self._hb_failures[idx] = 0
+                continue
             try:
                 ray.get(actor.heartbeat.remote(), timeout=self.heartbeat_timeout)
                 self._hb_failures[idx] = 0
