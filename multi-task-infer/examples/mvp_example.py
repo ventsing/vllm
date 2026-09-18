@@ -17,8 +17,9 @@ PROMPTS = [
     "The capital of France is",
 ]
 
-# Single-node TP: 1, 2, or 4. Must not exceed the node's device count; the
-# pool is pre-started with the same number of contiguous devices.
+# Single-node TP: up to the node's device count (4/8/16 all go through the
+# same executor path). The pool is pre-started with the same number of
+# contiguous devices.
 TP_SIZE = 1
 MODELS = [
     "/opt/huawei/dataset/downloaded_models/Qwen3.5-4B",
