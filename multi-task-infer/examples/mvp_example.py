@@ -17,7 +17,8 @@ PROMPTS = [
     "The capital of France is",
 ]
 
-# Phase 1 (TP=1) / phase 2 (TP=2): switch tp_size to 2 once TP=2 is validated.
+# Single-node TP: 1, 2, or 4. Must not exceed the node's device count; the
+# pool is pre-started with the same number of contiguous devices.
 TP_SIZE = 1
 MODELS = [
     "/opt/huawei/dataset/downloaded_models/Qwen3.5-4B",

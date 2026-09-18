@@ -100,7 +100,7 @@ def main() -> None:
     parser.add_argument(
         "--models", default=DEFAULT_MODELS, help="comma-separated model ids"
     )
-    parser.add_argument("--tp", type=int, default=1, choices=(1, 2))
+    parser.add_argument("--tp", type=int, default=1)
     parser.add_argument(
         "--warmup", action="store_true", help="NCCL warmup at pre_start"
     )

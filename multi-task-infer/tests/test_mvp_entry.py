@@ -41,10 +41,15 @@ def test_valid_tp2_pp1_passes():
     mvp.validate_mvp_config(tp_size=2, pp_size=1)  # no raise
 
 
+def test_valid_tp4_pp1_passes():
+    """TP=4 PP=1 single-node is within the MVP envelope."""
+    mvp.validate_mvp_config(tp_size=4, pp_size=1)  # no raise
+
+
 @pytest.mark.parametrize(
     "kwargs, message",
     [
-        ({"tp_size": 4}, "TP in {1, 2}"),
+        ({"tp_size": 0}, "positive"),
         ({"tp_size": 1, "pp_size": 2}, "PP=1"),
         ({"tp_size": 1, "num_nodes": 2}, "single-node"),
         ({"tp_size": 1, "enable_lora": True}, "LoRA"),

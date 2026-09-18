@@ -35,13 +35,13 @@ def validate_mvp_config(
 
     Raises:
         ValueError: If any argument falls outside the MVP envelope
-            (single-node, fixed TP in {1, 2}, PP=1, no LoRA / KV sharing /
-            elastic EP / autoscaling).
+            (single-node, positive TP, PP=1, no LoRA / KV sharing / elastic
+            EP / autoscaling).
     """
     if pp_size != 1:
         raise ValueError(f"MVP supports PP=1 only, got pp_size={pp_size}")
-    if tp_size not in (1, 2):
-        raise ValueError(f"MVP supports TP in {{1, 2}}, got tp_size={tp_size}")
+    if tp_size < 1:
+        raise ValueError(f"tp_size must be positive, got tp_size={tp_size}")
     if num_nodes != 1:
         raise ValueError(f"MVP is single-node only, got num_nodes={num_nodes}")
     if enable_lora:
@@ -108,7 +108,8 @@ def run_mvp(
     Args:
         model: Local model directory or HuggingFace model id.
         prompts: Prompts to generate from.
-        tp_size: Tensor parallelism (1 or 2 in the MVP).
+        tp_size: Tensor parallelism (single-node; upper bound is the node's
+            device count).
         pp_size: Pipeline parallelism (1 in the MVP).
         max_tokens: Maximum tokens to generate per prompt.
         temperature: Sampling temperature.

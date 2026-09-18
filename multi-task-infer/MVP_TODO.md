@@ -6,7 +6,7 @@
 
 ## 一、范围
 
-- 单节点；第一阶段 TP=1，第二阶段同节点 TP=2；PP 固定 1。
+- 单节点；TP 按单机卡数（1/2/4，需连续设备）；PP 固定 1。
 - 一个 Actor 同时只属于一个任务；任务完成后归还 Actor，再启动下一任务。
 - 权重用本地模型目录，编译用 vLLM 原生缓存。
 - **暂不启用**：动态扩缩容、在途请求迁移、跨节点 KV 共享、分层存储、LoRA。
@@ -96,8 +96,9 @@
 1. [x] `examples/mvp_example.py`（TP=1，顺序复用同一批 Actor）端到端出字：
    `--rounds 50 --enforce-eager` 已在真机 Ascend NPU 跑通（2026-09）。多轮
    复用稳定；期间清掉的 4 层生命周期卡点见本节末「多轮复用修复记录」。
-2. TP=2（`tp_size=2`）启动：`all_kwargs` 长度、`rpc_rank=rank`、设备映射
-   （`assigned_physical_gpu_ids`）在多 worker 下正确。
+2. [x] TP=2（`tp_size=2`）启动：`all_kwargs` 长度、`rpc_rank=rank`、设备映射
+   （`assigned_physical_gpu_ids`）在多 worker 下正确（真机已跑通）。TP=4
+   已放开入口门控（`validate_mvp_config` TP 上限移除），待真机验证。
 3. 任务完成后 `pool.release` 归还租约，registry `free_gpus` 恢复，下一个
    任务能再次 `acquire` 同一批 Actor；中断（Ctrl-C / 异常）后 `finally` 归还。
 4. 心跳线程不把租用中的 Actor 覆盖回 idle；`reset` 失败时 Actor 被隔离
@@ -124,8 +125,8 @@
    socket 关不干净 → context 泄漏，下一轮 GC `__del__→term` 卡死。修：shutdown
    挪进活 loop（`asyncio.to_thread`，`dd1d223bb9`）。
 
-第 1 项（TP=1 复用）在 apply 上述修复后 50 轮 enforce-eager 跑通；默认
-（带图 capture）模式与 TP=2 仍待验证。
+第 1 项（TP=1 复用）在 apply 上述修复后 50 轮 enforce-eager 跑通；TP=2 也已
+跑通。默认（带图 capture）模式与 TP=4 仍待验证。
 
 ## 七、P1 量化脚本（已交付 `examples/benchmark_startup.py`，待真机运行）
 
