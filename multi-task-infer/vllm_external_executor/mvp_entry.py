@@ -58,6 +58,27 @@ def validate_mvp_config(
         )
 
 
+def _detach_stuck_mm_warmup(llm, grace: float = 5.0) -> None:
+    """Stop a stuck background multimodal warmup from blocking shutdown.
+
+    vLLM's renderer joins its background MM warmup future in ``shutdown``
+    with no timeout. On NPU that warmup can stall after many engine
+    lifetimes, which would hang pool release and the next round. Detach the
+    future so ``renderer.shutdown`` skips the join; the pooled actors are
+    released either way.
+    """
+    renderer = getattr(llm, "renderer", None)
+    future = getattr(renderer, "_mm_warmup_future", None) if renderer else None
+    if future is None or future.done():
+        return
+    try:
+        future.result(timeout=grace)
+    except Exception:
+        # Timed out or the warmup failed: detach so shutdown cannot hang.
+        pass
+    renderer._mm_warmup_future = None
+
+
 def run_mvp(
     model: str,
     prompts: list[str],
@@ -178,6 +199,7 @@ def run_mvp(
     finally:
         try:
             if llm is not None:
+                _detach_stuck_mm_warmup(llm)
                 llm.shutdown(timeout=cleanup_timeout)
         finally:
             try:
