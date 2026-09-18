@@ -177,6 +177,7 @@ class NodeRegistryActor:
         lease_id: str,
         fault_domain_constraint: dict[str, int] | None = None,
         prefer_driver_node: str | None = None,
+        require_contiguous_devices: bool = False,
     ) -> list[str]:
         """Atomically select and lease ``world_size`` idle actors.
 
@@ -198,6 +199,7 @@ class NodeRegistryActor:
                     world_size,
                     fault_domain_constraint=fault_domain_constraint,
                     prefer_driver_node=prefer_driver_node,
+                    require_contiguous_devices=require_contiguous_devices,
                 )
             except (RuntimeError, ValueError):
                 return []

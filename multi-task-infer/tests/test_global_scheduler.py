@@ -42,11 +42,13 @@ def make_node(node_id, fault_domain=None):
     )
 
 
-def make_actor(actor_id, node_id, fault_domain=None, state="idle"):
+def make_actor(
+    actor_id, node_id, fault_domain=None, state="idle", device_id=0
+):
     return ActorRegistration(
         actor_id=actor_id,
         node_id=node_id,
-        device_id=0,
+        device_id=device_id,
         fault_domain=fault_domain or node_id,
         state=state,
     )
@@ -140,6 +142,109 @@ def test_constraint_exceeds_domain_raises():
 def test_zero_world_size_raises():
     with pytest.raises(ValueError):
         GlobalScheduler.select_actors([], [], world_size=0)
+
+
+def test_contiguous_tp2_picks_lowest_run():
+    nodes = [make_node("n0")]
+    actors = [
+        make_actor("a0", "n0", device_id=0),
+        make_actor("a1", "n0", device_id=1),
+        make_actor("a2", "n0", device_id=2),
+        make_actor("a3", "n0", device_id=3),
+    ]
+
+    selected = GlobalScheduler.select_actors(
+        actors, nodes, world_size=2, require_contiguous_devices=True
+    )
+    assert selected == ["a0", "a1"]
+
+
+def test_contiguous_skips_hole():
+    """A leased device 1 leaves idle {0,2,3}; TP=2 must pick {2,3}."""
+    nodes = [make_node("n0")]
+    actors = [
+        make_actor("a0", "n0", device_id=0),
+        make_actor("a2", "n0", device_id=2),
+        make_actor("a3", "n0", device_id=3),
+    ]
+
+    selected = GlobalScheduler.select_actors(
+        actors, nodes, world_size=2, require_contiguous_devices=True
+    )
+    assert selected == ["a2", "a3"]
+
+
+def test_contiguous_tp4_picks_run_of_four():
+    nodes = [make_node("n0")]
+    actors = [
+        make_actor(f"a{d}", "n0", device_id=d) for d in range(8)
+    ]
+
+    selected = GlobalScheduler.select_actors(
+        actors, nodes, world_size=4, require_contiguous_devices=True
+    )
+    assert selected == ["a0", "a1", "a2", "a3"]
+
+
+def test_contiguous_cannot_span_nodes():
+    nodes = [make_node("n0"), make_node("n1")]
+    actors = [
+        make_actor("a0", "n0", device_id=0),
+        make_actor("a1", "n0", device_id=1),
+        make_actor("b0", "n1", device_id=0),
+        make_actor("b1", "n1", device_id=1),
+    ]
+
+    with pytest.raises(RuntimeError):
+        GlobalScheduler.select_actors(
+            actors, nodes, world_size=4, require_contiguous_devices=True
+        )
+
+
+def test_contiguous_insufficient_run_raises():
+    nodes = [make_node("n0")]
+    actors = [
+        make_actor("a0", "n0", device_id=0),
+        make_actor("a2", "n0", device_id=2),  # no run of 2
+    ]
+
+    with pytest.raises(RuntimeError):
+        GlobalScheduler.select_actors(
+            actors, nodes, world_size=2, require_contiguous_devices=True
+        )
+
+
+def test_contiguous_rejects_constraint():
+    nodes = [make_node("n0")]
+    actors = [make_actor("a0", "n0", device_id=0)]
+
+    with pytest.raises(ValueError):
+        GlobalScheduler.select_actors(
+            actors,
+            nodes,
+            world_size=1,
+            fault_domain_constraint={"n0": 1},
+            require_contiguous_devices=True,
+        )
+
+
+def test_contiguous_prefers_driver_node():
+    nodes = [make_node("n0"), make_node("n1")]
+    actors = [
+        make_actor("a0", "n0", device_id=0),
+        make_actor("a1", "n0", device_id=1),
+        make_actor("b0", "n1", device_id=0),
+        make_actor("b1", "n1", device_id=1),
+    ]
+
+    selected = GlobalScheduler.select_actors(
+        actors,
+        nodes,
+        world_size=2,
+        require_contiguous_devices=True,
+        prefer_driver_node="n1",
+    )
+    assert selected == ["b0", "b1"]
 
 
 @pytest.mark.parametrize(

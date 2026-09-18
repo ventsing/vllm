@@ -127,6 +127,7 @@ class GlobalScheduler:
         world_size: int,
         fault_domain_constraint: dict[str, int] | None = None,
         prefer_driver_node: str | None = None,
+        require_contiguous_devices: bool = False,
     ) -> list[str]:
         """Select ``world_size`` idle actor ids for a lease.
 
@@ -137,16 +138,23 @@ class GlobalScheduler:
             world_size: Number of actors to select.
             fault_domain_constraint: Optional hard per-domain counts. Only
                 these domains are considered, and each domain contributes at
-                most its mandated count.
+                most its mandated count. Not supported together with
+                ``require_contiguous_devices``.
             prefer_driver_node: Optional node id; its domain acts as the first
                 tie-break when two domains have equivalent free counts.
+            require_contiguous_devices: When True, the whole lease must come
+                from one node as a *contiguous* run of device ids (e.g. TP=2 ->
+                {0,1}/{2,3}, TP=4 -> {0-3}/{4-7}), required by accelerators
+                whose inter-device links (e.g. Ascend HCCS) only span adjacent
+                devices.
 
         Returns:
             List of selected actor ids.
 
         Raises:
-            ValueError: If ``world_size`` <= 0 or a constraint references an
-                unknown / dead domain.
+            ValueError: If ``world_size`` <= 0, a constraint references an
+                unknown / dead domain, or a constraint is combined with
+                ``require_contiguous_devices``.
             RuntimeError: If fewer than ``world_size`` idle actors satisfy the
                 constraints.
         """
@@ -155,7 +163,19 @@ class GlobalScheduler:
 
         alive_nodes = {n.node_id for n in nodes}
 
-        if fault_domain_constraint is not None:
+        if require_contiguous_devices:
+            if fault_domain_constraint is not None:
+                raise ValueError(
+                    "require_contiguous_devices does not support "
+                    "fault_domain_constraint"
+                )
+            selected = cls._select_contiguous(
+                actors,
+                alive_nodes,
+                world_size,
+                prefer_driver_node,
+            )
+        elif fault_domain_constraint is not None:
             selected = cls._select_with_constraint(
                 actors,
                 alive_nodes,
@@ -274,6 +294,60 @@ class GlobalScheduler:
             taken[best] += 1
 
         return selected
+
+    @classmethod
+    def _select_contiguous(
+        cls,
+        actors: Iterable[ActorRegistration],
+        alive_nodes: set[str],
+        world_size: int,
+        prefer_driver_node: str | None,
+    ) -> list[str]:
+        """Select a contiguous run of ``world_size`` devices on one node.
+
+        Tensor parallelism within one node requires adjacent devices because
+        the high-bandwidth inter-device fabric (e.g. Ascend HCCS) links only
+        neighbouring devices. Idle actors are grouped per node, sorted by
+        device id, split into ascending runs, and the run with the lowest
+        driver-priority then lowest starting device id is chosen.
+        """
+        by_node: dict[str, list[ActorRegistration]] = {}
+        for actor in actors:
+            if actor.state != IDLE_STATE or actor.node_id not in alive_nodes:
+                continue
+            by_node.setdefault(actor.node_id, []).append(actor)
+
+        best: list[ActorRegistration] | None = None
+        best_key: tuple[int, int] | None = None
+        for node_id, node_actors in by_node.items():
+            for run in cls._contiguous_runs(node_actors):
+                if len(run) < world_size:
+                    continue
+                candidate = run[:world_size]
+                driver_priority = 0 if node_id == prefer_driver_node else 1
+                key = (driver_priority, candidate[0].device_id)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best = candidate
+        return [a.actor_id for a in best] if best else []
+
+    @staticmethod
+    def _contiguous_runs(
+        actors: Iterable[ActorRegistration],
+    ) -> list[list[ActorRegistration]]:
+        """Split actors into runs of consecutive device ids."""
+        runs: list[list[ActorRegistration]] = []
+        run: list[ActorRegistration] = []
+        prev: int | None = None
+        for actor in sorted(actors, key=lambda a: a.device_id):
+            if prev is not None and actor.device_id != prev + 1:
+                runs.append(run)
+                run = []
+            run.append(actor)
+            prev = actor.device_id
+        if run:
+            runs.append(run)
+        return runs
 
 
 def actor_resource_kwargs(device_key: str) -> dict:

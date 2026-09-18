@@ -402,19 +402,23 @@ class ActorPoolManager:
         fault_domain_constraint: dict[str, int] | None = None,
         prefer_driver_node: bool = True,
         node_constraint: dict[str, int] | None = None,
+        require_contiguous_devices: bool = True,
     ) -> list:
         """
-        Acquire idle actors for a vLLM instance, spread across fault domains.
+        Acquire idle actors for a vLLM instance.
 
         Args:
             tp_size: Tensor Parallel size.
             pp_size: Pipeline Parallel size.
             fault_domain_constraint: Optional per-fault-domain actor counts
                 (e.g. ``{"node-a": 2, "node-b": 2}``). Only these domains are
-                considered.
+                considered. Ignored when ``require_contiguous_devices``.
             prefer_driver_node: Prefer the driver node when counts tie.
             node_constraint: Deprecated alias of ``fault_domain_constraint``
                 (default fault domain is the node id, so the two coincide).
+            require_contiguous_devices: Select the whole lease from one node as
+                a contiguous run of device ids (TP=2 -> {0,1}/{2,3}, TP=4 ->
+                {0-3}/{4-7}). Defaults True for Ascend HCCS-style fabrics.
 
         Returns:
             List of acquired actor handles.
@@ -444,6 +448,7 @@ class ActorPoolManager:
                 lease_id,
                 fault_domain_constraint=fault_domain_constraint,
                 prefer_driver_node=prefer,
+                require_contiguous_devices=require_contiguous_devices,
             ),
             timeout=RPC_TIMEOUT,
         )
