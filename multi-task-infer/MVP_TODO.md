@@ -144,3 +144,8 @@ P2 未验证路径在 MVP 阶段被显式挡在入口之外（`NotImplementedErr
 保留不动。逐项规划、门控位置与「启用前必修」bug 已移至
 [docs/p2_followups.md](docs/p2_followups.md)，启用时可按下述顺序：修 bug →
 撤门控 → 补测试 → 建立该能力的真机验证清单。
+
+多节点 pool 的现状与缺口见 `docs/p2_followups.md` §2.9：骨架已具备
+（placement group spread / 跨节点 registry / 节点故障恢复 / TCPStore 握手），
+但真机从未验证，且有三处待补——HCCL 跨节点 rank table、连续设备约束的
+跨节点回落、跨节点 KV 传输。MVP 按单节点（TP=1/2/4 单机、PP=1）收敛。

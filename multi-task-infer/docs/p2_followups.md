@@ -16,6 +16,7 @@
 | 自动故障恢复 + 动态扩缩容 | — | 默认禁用（不调 `set_autoscaler`/`maybe_autoscale`） | `actor_pool_manager.py` |
 | LoRA | — | 禁用（`lora_config.max_loras > 0` 报错） | `external_executor.py` `_validate_mvp_scope` |
 | 分层存储（storage tiering） | — | 禁用（`tiered_cache` 非 None 报错） | `external_executor.py` `__init__` |
+| 多节点 pool（跨节点 TP/PP） | 多节点扩展 | 骨架存在、真机未验证（单机 MVP 范围外） | `cluster_state.py` / `external_worker_actor.py` |
 
 ## 二、逐项说明
 
@@ -85,6 +86,27 @@
   `TieredCache` 已实现纯逻辑）。
 - 启用前：接入实际的 KV 块申请/回收路径，验证 tiering 决策与迁移状态机
   （`migration_orchestrator`）的联动。
+
+### 2.9 多节点 pool（跨节点 TP/PP）
+
+- 现状：骨架已具备——placement group `strategy="spread"`、`node_mapping`
+  + `_group_workers_by_node`、registry 跨节点注册/`get_global_view`、
+  `detect_dead_nodes` + `recover_node`、`GlobalScheduler` 跨 fault-domain
+  spread、`create_dist_init_method` 用 `TCPStore` 做进程组握手。但**从未在
+  真实多机环境跑通**，MVP 所有真机验证均为单节点 Ascend。
+- 启用前必修（按顺序）：
+  1. **HCCL 跨节点 rank table**：`create_dist_init_method` 只建了 TCPStore
+     （仅进程组 rendezvous）；真正的 tensor 集合通信走 HCCL，跨节点需生成/
+     传递 `RANK_TABLE_FILE`（每 rank 的 IP + 设备映射），否则卡在 HCCL 建链。
+  2. **连续设备约束回落**：`GlobalScheduler._select_contiguous` 按 node 内
+     连续段选 Actor，默认把 TP 组锁死单节点；跨节点 TP 需在
+     `require_contiguous_devices=False` 时正确回落 spread，并确认跨节点 TP
+     组合（如 node0 `{0,1}` + node1 `{0,1}`）的 rank 布局。
+  3. **跨节点 KV 传输**：`kv_transfer_config` 在 MVP 入口门控报错，需决定
+     启用（补 RDMA/网络后端）还是明确放弃。
+- 验证：需真实多机（≥2 节点、每节点多卡）：`pre_start(strategy="spread")`
+  铺卡、跨节点 `acquire(tp, pp)` rank 对齐、跨节点 HCCL allreduce、跨节点
+  故障恢复（`recover_node`）。
 
 ## 三、启用流程（建议）
 
