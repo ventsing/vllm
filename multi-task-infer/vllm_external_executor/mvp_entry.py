@@ -195,15 +195,23 @@ def run_mvp(
                 texts.append(final.outputs[0].text if final else "")
             return texts
 
-        return asyncio.run(_generate())
+        async def _run() -> list[str]:
+            try:
+                return await _generate()
+            finally:
+                # Shutdown while the event loop is still alive so MPClient's
+                # asyncio ZMQ sockets close on the live loop (via
+                # close_sockets_and_tasks) instead of the "loop closed"
+                # fallback. Otherwise the zmq context lingers and its
+                # __del__ -> destroy -> term hangs on a later engine's GC.
+                if llm is not None:
+                    _detach_stuck_mm_warmup(llm)
+                    await asyncio.to_thread(llm.shutdown, cleanup_timeout)
+
+        return asyncio.run(_run())
     finally:
         try:
-            if llm is not None:
-                _detach_stuck_mm_warmup(llm)
-                llm.shutdown(timeout=cleanup_timeout)
+            pool.release(actors)
         finally:
-            try:
-                pool.release(actors)
-            finally:
-                if own_pool:
-                    pool.shutdown()
+            if own_pool:
+                pool.shutdown()
