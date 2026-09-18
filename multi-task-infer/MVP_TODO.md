@@ -93,8 +93,9 @@
 以下项已按 vLLM `RayExecutorV2`/`WorkerProc` 参考实现完成代码修复，并通过
 `py_compile` + 离线逻辑校验，但**尚未在真实 GPU 上跑通**，需按顺序验证：
 
-1. `examples/mvp_example.py`（TP=1，两个模型顺序复用同一批 Actor）能端到端
-   出字，无 `AttributeError`/`ResponseStatus` 误判/`collective_rpc` 超时。
+1. [x] `examples/mvp_example.py`（TP=1，顺序复用同一批 Actor）端到端出字：
+   `--rounds 50 --enforce-eager` 已在真机 Ascend NPU 跑通（2026-09）。多轮
+   复用稳定；期间清掉的 4 层生命周期卡点见本节末「多轮复用修复记录」。
 2. TP=2（`tp_size=2`）启动：`all_kwargs` 长度、`rpc_rank=rank`、设备映射
    （`assigned_physical_gpu_ids`）在多 worker 下正确。
 3. 任务完成后 `pool.release` 归还租约，registry `free_gpus` 恢复，下一个
@@ -102,6 +103,29 @@
 4. 心跳线程不把租用中的 Actor 覆盖回 idle；`reset` 失败时 Actor 被隔离
    （标记 FAILED + `mark_actor_failed`），不被再次分配。
 5. 启动收益量化：预热池 vs 冷启动 vLLM 的端到端时延对比（P1 第七节）。
+
+### 多轮复用修复记录（真机，2026-09）
+
+驱动进程复用同一批 `ExternalWorkerActor` 跑 N 轮 `run_mvp` 时，逐层清出的
+生命周期清理卡点（每修一层暴露下一层）：
+
+1. **心跳丢失**（约第 10 轮）——租用/加载/reset 期间 Ray sync-actor RPC 排队
+   被误判超时。修：心跳轮在非 IDLE 时整体跳过；executor monitor 心跳
+   `timeout=5.0` 且不 kill。
+2. **HBM OOM**（switch 复用第二轮）——Ascend 平台 worker 不走
+   `GPUWorker.shutdown()` 的 model-runner 释放，model/KV 引用跨轮残留。修：
+   `_release_worker_resources()` 显式丢 model/KV/workspace/ROPE/图资源 +
+   `gc.collect()` 后 `empty_cache()`。
+3. **MM warmup join 卡死 shutdown**——`renderer.shutdown()` 用
+   `future.result()` 无超时 join 后台 mm warmup。修：`_join_mm_warmup(timeout)`
+   跟随 `shutdown(timeout)`（`fc2a33b960`）+ `run_mvp` 端 grace detach。
+4. **zmq Context 泄漏卡死 GC**（约第 18 轮）——`asyncio.run` 返回后 loop 已
+   关才 `llm.shutdown()`，MPClient 走 "loop closed" 降级清理，asyncio ZMQ
+   socket 关不干净 → context 泄漏，下一轮 GC `__del__→term` 卡死。修：shutdown
+   挪进活 loop（`asyncio.to_thread`，`dd1d223bb9`）。
+
+第 1 项（TP=1 复用）在 apply 上述修复后 50 轮 enforce-eager 跑通；默认
+（带图 capture）模式与 TP=2 仍待验证。
 
 ## 七、P1 量化脚本（已交付 `examples/benchmark_startup.py`，待真机运行）
 
