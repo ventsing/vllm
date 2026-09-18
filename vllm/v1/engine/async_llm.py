@@ -275,7 +275,7 @@ class AsyncLLM(EngineClient):
         shutdown_prometheus()
 
         if renderer := getattr(self, "renderer", None):
-            renderer.shutdown()
+            renderer.shutdown(timeout=timeout)
 
         if engine_core := getattr(self, "engine_core", None):
             engine_core.shutdown(timeout=timeout)

@@ -5,7 +5,7 @@ import time
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from contextlib import ExitStack
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
@@ -329,14 +329,15 @@ class BaseRenderer(ABC, Generic[_T]):
             return  # already launched
         self._mm_warmup_future = self._mm_executor.submit(self.warmup_mm)
 
-    def _join_mm_warmup(self) -> None:
+    def _join_mm_warmup(self, timeout: float | None = None) -> None:
         # Wait for the background MM warmup task to finish, if one was started.
         # Called from the main / event-loop thread (reset_mm_cache, warmup,
         # shutdown) — never from inside the _mm_executor worker — so
-        # waiting on the future cannot deadlock.
+        # waiting on the future cannot deadlock. ``timeout`` bounds the wait;
+        # ``None`` blocks until the warmup finishes (historical behaviour).
         future = getattr(self, "_mm_warmup_future", None)
         if future is not None:
-            future.result()
+            future.result(timeout=timeout)
             self._mm_warmup_future = None
 
     def warmup(self, chat_params: ChatParams) -> None:
@@ -381,12 +382,19 @@ class BaseRenderer(ABC, Generic[_T]):
         races with concurrent process_inputs on the mm_processor_cache."""
         await self._clear_mm_cache_async()
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         # Wait for any background MM warmup to finish first: it runs on the
         # _mm_executor and touches the mm_processor_cache, so it must be
         # quiescent before _resources.close() tears down the executors and
-        # the cache (both are registered as resources in __init__).
-        self._join_mm_warmup()
+        # the cache (both are registered as resources in __init__). A stuck
+        # warmup must not block shutdown forever, so honour ``timeout``.
+        try:
+            self._join_mm_warmup(timeout=timeout)
+        except TimeoutError:
+            logger.warning(
+                "Background multimodal warmup did not finish; skipping join"
+            )
+            self._mm_warmup_future = None
         self._resources.close()
 
     def get_bos_token_id(self) -> int | None:
