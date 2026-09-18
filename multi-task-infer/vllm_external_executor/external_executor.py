@@ -667,7 +667,16 @@ class ExternalExecutor(RayExecutorV2):
         def monitor_workers() -> None:
             while not _should_stop() and ray.is_initialized():
                 try:
-                    ray.get([h.actor.heartbeat.remote() for h in handles])
+                    refs = [h.actor.heartbeat.remote() for h in handles]
+                    ray.get(refs, timeout=5.0)
+                except ray.exceptions.GetTimeoutError:
+                    # Do not cancel actor tasks: force-cancel can remove the
+                    # actor lineage reference and kill a pooled actor.
+                    if _should_stop():
+                        return
+                    logger.warning(
+                        "ExternalWorkerActor heartbeat delayed; continuing"
+                    )
                 except Exception:
                     if _should_stop():
                         return

@@ -15,6 +15,8 @@ instead of silently entering an untested path.
 
 from __future__ import annotations
 
+import os
+
 # Kept free of torch/ray/vllm imports so the constraint checks stay unit-testable
 # without a cluster (see tests/test_mvp_entry.py).
 
@@ -115,6 +117,11 @@ def run_mvp(
     )
 
     import asyncio
+
+    # Each AsyncLLM creates a continuous usage reporter. The MVP reuses a
+    # process across many engine lifetimes, so disable telemetry before any
+    # vLLM imports or child EngineCore processes are created.
+    os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs

@@ -111,6 +111,10 @@ class ExternalWorkerActor:
     
     def _import_common_libraries(self):
         """Import common libraries to speed up subsequent initialization."""
+        # Pooled actors create one continuous usage reporter per engine.
+        # Disable telemetry here so repeated model reloads cannot accumulate
+        # unbounded reporter threads or block shutdown on network I/O.
+        os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
         import torch.distributed as dist
         import vllm
         from vllm.v1.worker.worker_base import WorkerWrapperBase

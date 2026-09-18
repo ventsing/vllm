@@ -946,11 +946,12 @@ class ActorPoolManager:
             self._hb_stop.wait(self.heartbeat_interval)
 
     def _heartbeat_round(self, ray) -> None:
-        # Node liveness must keep refreshing while an actor is leased or being
-        # reset; otherwise a long model load/reset (>node timeout) would let
-        # detect_dead_nodes misfire and rebuild a live node. Only the per-actor
-        # probe defers on busy actors (sync Ray actors serialize RPCs, so a
-        # probe behind lifecycle work reads as a false timeout).
+        # Ray actor and registry RPCs can queue behind model load, inference,
+        # shutdown, or reset. Probing during those phases turns normal work
+        # into heartbeat timeouts and can race actor reset. The next idle
+        # round refreshes node and actor liveness together.
+        if any(state is not ActorState.IDLE for state in self.states.values()):
+            return
         if self.registry is not None:
             self._heartbeat_nodes_and_recover(ray)
         self._heartbeat_actors(ray)

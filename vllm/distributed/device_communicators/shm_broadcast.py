@@ -364,10 +364,22 @@ class ShmRingBuffer:
         )
 
     def __del__(self):
-        if hasattr(self, "shared_memory"):
-            self.shared_memory.close()
-            if self.is_creator:
-                self.shared_memory.unlink()
+        shm = getattr(self, "shared_memory", None)
+        if shm is None:
+            return
+        try:
+            shm.close()
+        except Exception:
+            pass
+        if getattr(self, "is_creator", False):
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                # Explicit queue teardown may already have unlinked it.
+                pass
+            except Exception:
+                pass
+            self.is_creator = False
 
     @contextmanager
     def get_data(self, current_idx: int):
@@ -481,7 +493,8 @@ class MessageQueue:
         n_remote_reader = n_reader - n_local_reader
         self.n_remote_reader = n_remote_reader
         self.shutting_down = False
-        context = Context()
+        self._context = Context()
+        context = self._context
 
         if n_local_reader > 0:
             # for local readers, we will:
@@ -562,7 +575,8 @@ class MessageQueue:
         self.handle = handle
         self._is_writer = False
 
-        context = Context()
+        self._context = Context()
+        context = self._context
 
         if rank in handle.local_reader_ranks:
             assert handle.buffer_handle is not None

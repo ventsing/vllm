@@ -60,7 +60,19 @@ def close_message_queue(mq) -> None:
             if getattr(buf, "is_creator", False):
                 try:
                     shm.unlink()
+                except FileNotFoundError:
+                    pass
                 except Exception:
                     pass
+                # Prevent ShmRingBuffer.__del__ from unlinking again.
+                buf.is_creator = False
         del buf
         mq.buffer = None
+
+    context = getattr(mq, "_context", None)
+    if context is not None:
+        try:
+            context.destroy(linger=0)
+        except Exception:
+            pass
+        mq._context = None
