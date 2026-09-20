@@ -167,6 +167,7 @@ class ExternalExecutor(RayExecutorV2):
         validate_mvp_config(
             tp_size=pc.tensor_parallel_size,
             pp_size=pc.pipeline_parallel_size,
+            num_nodes=pc.nnodes,
             enable_lora=has_lora,
             kv_transfer_config=ktc if has_kv_connector else None,
             elastic_ep=getattr(pc, "enable_elastic_ep", False),
@@ -323,10 +324,15 @@ class ExternalExecutor(RayExecutorV2):
         # Step 4: Initialize workers
         # Get distributed init method from the first worker. Pass world_size so
         # the worker does not need a vllm_config of its own yet (see 2.3).
+        # file:// rendezvous is only valid when every worker shares one node's
+        # filesystem, so judge by the actual handle spread rather than the
+        # configured nnodes: a world_size larger than one node's device count
+        # lands workers on several nodes and must fall back to a TCPStore.
+        num_nodes = len({h.node_id for h in self.ray_worker_handles})
         distributed_init_method = ray.get(
             self.ray_worker_handles[0].actor.create_dist_init_method.remote(
                 self.world_size,
-                self.parallel_config.nnodes,
+                num_nodes,
             )
         )
         

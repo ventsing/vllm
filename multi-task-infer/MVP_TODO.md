@@ -130,8 +130,11 @@
    彻底，累积到端口回绕时 `init_process_group` bind 撞 EADDRINUSE。修：
    单节点 `create_dist_init_method` 改用 `file://` rendezvous（FileStore，
    无 TCP 端口，与 vLLM uniproc/multiproc executor 同路），彻底消除端口
-   churn；多节点（P2）才回落 TCPStore。系统层 `tcp_tw_reuse=1` 兜底。TP
-   会变（4→2）所以「复用进程组」不成立，不做。
+   churn。**file:// 仅当所有 worker 同节点成立**，按实际 node 分布判断
+   （`h.node_id` 去重），world_size > 单节点卡数时 Ray 会跨节点铺卡、自动
+   回落 TCPStore；`validate_mvp_config` 的 `num_nodes` 也接上 `pc.nnodes`，
+   多节点在入口报错。TP 会变（4→2）所以「复用进程组」不成立，不做；不动
+   内核 sysctl。
 
 第 1 项（TP=1 复用）在 apply 上述修复后 50 轮 enforce-eager 跑通；TP=2 也已
 跑通；TP=4 已跑通但多轮复用触发上面的端口复用问题（见第 5 条）。默认（带图
