@@ -312,17 +312,26 @@ class ExternalWorkerActor:
 
         self.state = ActorState.LEASED
 
-    def create_dist_init_method(self, world_size: int) -> str:
+    def create_dist_init_method(self, world_size: int, nnodes: int = 1) -> str:
         """
         Create a distributed initialization method.
 
         Args:
             world_size: Total number of workers (TP x PP). Passed by the
                 executor so this method needs no prior ``vllm_config``.
+            nnodes: Number of nodes in the parallel group. Single-node groups
+                (the MVP) use a ``file://`` rendezvous, which owns no TCP
+                listen socket and therefore cannot leak ports across the
+                multi-round reuse; multi-node groups need a TCPStore daemon.
 
         Returns:
             Distributed initialization method string
         """
+        from vllm.utils.network_utils import get_file_store_init_method
+
+        if nnodes == 1:
+            return get_file_store_init_method()
+
         import ray
         from torch.distributed import TCPStore
         from vllm.utils.network_utils import get_distributed_init_method

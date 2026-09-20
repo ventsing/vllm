@@ -128,9 +128,10 @@
 5. **集合通信端口复用 EADDRINUSE**（TP=4 约第 80 轮）——多轮复用每轮
    re-init/destroy 进程组，master TCPStore daemon 的 listen socket 释放不
    彻底，累积到端口回绕时 `init_process_group` bind 撞 EADDRINUSE。修：
-   reset 时 destroy 后显式 `del store` + `gc.collect()`（`5225875383`）；配
-   系统层 `tcp_tw_reuse=1`。**根治（P1）**：同 TP 拓扑下复用进程组，不每轮
-   destroy。
+   单节点 `create_dist_init_method` 改用 `file://` rendezvous（FileStore，
+   无 TCP 端口，与 vLLM uniproc/multiproc executor 同路），彻底消除端口
+   churn；多节点（P2）才回落 TCPStore。系统层 `tcp_tw_reuse=1` 兜底。TP
+   会变（4→2）所以「复用进程组」不成立，不做。
 
 第 1 项（TP=1 复用）在 apply 上述修复后 50 轮 enforce-eager 跑通；TP=2 也已
 跑通；TP=4 已跑通但多轮复用触发上面的端口复用问题（见第 5 条）。默认（带图

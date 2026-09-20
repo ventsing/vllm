@@ -325,7 +325,8 @@ class ExternalExecutor(RayExecutorV2):
         # the worker does not need a vllm_config of its own yet (see 2.3).
         distributed_init_method = ray.get(
             self.ray_worker_handles[0].actor.create_dist_init_method.remote(
-                self.world_size
+                self.world_size,
+                self.parallel_config.nnodes,
             )
         )
         
