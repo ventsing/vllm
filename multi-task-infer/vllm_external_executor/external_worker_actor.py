@@ -323,14 +323,26 @@ class ExternalWorkerActor:
         Returns:
             Distributed initialization method string
         """
+        import socket
+
         import ray
-        from torch.distributed import TCPStore
+        from vllm.distributed.utils import create_tcp_store
         from vllm.utils.network_utils import get_distributed_init_method
 
         host = ray.util.get_node_ip_address()
-        store = TCPStore(
-            host_name=host,
-            port=0,
+        # The pooled worker re-creates a rendezvous store every round. The
+        # previous round's process group may leave the port in TIME_WAIT, so
+        # bind with SO_REUSEADDR (same as vLLM's StatelessProcessGroup) to let
+        # this round reuse it instead of failing after ~80 reuse cycles.
+        listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen_socket.bind((host, 0))
+        listen_socket.listen()
+        port = listen_socket.getsockname()[1]
+        store = create_tcp_store(
+            host,
+            port,
+            listen_socket=listen_socket,
             world_size=world_size,
             is_master=True,
             wait_for_workers=False,
@@ -338,7 +350,7 @@ class ExternalWorkerActor:
         )
         self._dist_init_store = store
 
-        return get_distributed_init_method(host, store.port)
+        return get_distributed_init_method(host, port)
     
     def init_device(self) -> None:
         """
@@ -1051,13 +1063,15 @@ class ExternalWorkerActor:
                 close_message_queue(mq)
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
-        self._dist_init_store = None
         self._active_checkpoint_path = None
         self._active_storage_config = None
 
         # Ordinary workers exit their process. Pooled workers must explicitly
         # release global process groups and collect frozen/cyclic model objects.
         cleanup_dist_env_and_memory(shutdown_ray=False)
+        # Drop the TCPStore after the process group is destroyed so its master
+        # listen socket closes synchronously instead of lingering on GC.
+        self._dist_init_store = None
         if device_module is not None:
             gc.collect()
             device_module.empty_cache()
