@@ -125,9 +125,16 @@
    关才 `llm.shutdown()`，MPClient 走 "loop closed" 降级清理，asyncio ZMQ
    socket 关不干净 → context 泄漏，下一轮 GC `__del__→term` 卡死。修：shutdown
    挪进活 loop（`asyncio.to_thread`，`dd1d223bb9`）。
+5. **集合通信端口复用 EADDRINUSE**（TP=4 约第 80 轮）——多轮复用每轮
+   re-init/destroy 进程组，master TCPStore daemon 的 listen socket 释放不
+   彻底，累积到端口回绕时 `init_process_group` bind 撞 EADDRINUSE。修：
+   reset 时 destroy 后显式 `del store` + `gc.collect()`（`5225875383`）；配
+   系统层 `tcp_tw_reuse=1`。**根治（P1）**：同 TP 拓扑下复用进程组，不每轮
+   destroy。
 
 第 1 项（TP=1 复用）在 apply 上述修复后 50 轮 enforce-eager 跑通；TP=2 也已
-跑通。默认（带图 capture）模式与 TP=4 仍待验证。
+跑通；TP=4 已跑通但多轮复用触发上面的端口复用问题（见第 5 条）。默认（带图
+capture）模式仍待验证。
 
 ## 七、P1 量化脚本（已交付 `examples/benchmark_startup.py`，待真机运行）
 
