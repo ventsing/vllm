@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING
 
 from vllm.platforms import current_platform
 
-from vllm_external_executor.cluster_state import actor_resource_kwargs
+from vllm_external_executor.cluster_state import (
+    REGISTRY_ACTOR_NAME,
+    REGISTRY_ACTOR_NAMESPACE,
+    actor_resource_kwargs,
+)
 from vllm_external_executor.external_worker_actor import ActorState, ExternalWorkerActor
 
 if TYPE_CHECKING:
@@ -39,9 +43,6 @@ DEFAULT_HEARTBEAT_TIMEOUT = 30.0
 # flap, but a node is only declared dead when its *node* heartbeat stalls.
 DEFAULT_NODE_HEARTBEAT_TIMEOUT = 60.0
 MAX_HEARTBEAT_FAILURES = 3
-# Name of the detached registry actor; a second process attaches with
-# ray.get_actor(REGISTRY_ACTOR_NAME) to share a pre-started pool.
-REGISTRY_ACTOR_NAME = "external-executor-node-registry"
 
 
 class ActorPoolManager:
@@ -330,7 +331,7 @@ class ActorPoolManager:
         import ray
 
         if registry is None:
-            registry = ray.get_actor(registry_name)
+            registry = ray.get_actor(registry_name, namespace=REGISTRY_ACTOR_NAMESPACE)
         self.registry = registry
 
         regs = ray.get(registry.list_actors.remote(), timeout=RPC_TIMEOUT)

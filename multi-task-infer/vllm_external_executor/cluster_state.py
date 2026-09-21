@@ -28,6 +28,13 @@ from typing import Iterable
 # against the string values declared here, which mirror ActorState.
 IDLE_STATE = "idle"
 
+# Detached registry actor identity. The namespace must be shared by every
+# process (owner and attached clients); the default/anonymous namespace is
+# per-process, so an owner-created detached actor would be invisible to a
+# worker that looks it up by name alone.
+REGISTRY_ACTOR_NAME = "external-executor-node-registry"
+REGISTRY_ACTOR_NAMESPACE = "external-executor"
+
 
 @dataclass
 class NodeInfo:

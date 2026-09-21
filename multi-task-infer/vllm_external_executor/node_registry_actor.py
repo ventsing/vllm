@@ -25,6 +25,8 @@ import time
 from typing import Any
 
 from vllm_external_executor.cluster_state import (
+    REGISTRY_ACTOR_NAME,
+    REGISTRY_ACTOR_NAMESPACE,
     ActorRegistration,
     GlobalScheduler,
     NodeInfo,
@@ -389,6 +391,10 @@ def create_registry_actor() -> "Any":
 
     return (
         ray.remote(NodeRegistryActor)
-        .options(name="external-executor-node-registry", lifetime="detached")
+        .options(
+            name=REGISTRY_ACTOR_NAME,
+            namespace=REGISTRY_ACTOR_NAMESPACE,
+            lifetime="detached",
+        )
         .remote()
     )
