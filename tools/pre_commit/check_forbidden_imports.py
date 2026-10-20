@@ -65,8 +65,12 @@ CHECK_IMPORTS = {
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
             "vllm/v1/executor/ray_executor.py",
+            # External workers share the executor's callable RPC serialization.
+            "multi-task-infer/vllm_external_executor/external_worker_actor.py",
             "vllm/entrypoints/llm.py",
             "tests/utils.py",
+            # Verify that pooled RPC outputs can be serialized without events.
+            "multi-task-infer/tests/test_external_worker_actor.py",
             # pickle and cloudpickle
             "vllm/v1/serial_utils.py",
         },

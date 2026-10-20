@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyright: Copyright contributors to the vLLM project
 
 """
@@ -11,38 +12,38 @@ common libraries to speed up subsequent vLLM instance initialization.
 import os
 import threading
 from enum import Enum
-from typing import Any
 
 import torch
 
 
 class ActorState(str, Enum):
     """Actor lifecycle states."""
-    IDLE = "idle"                    # 空闲，可被租用
-    LEASED = "leased"                # 已租用，等待初始化
-    INIT_DEVICE = "init_device"      # 设备已初始化（NCCL/HCCl 已初始化）
-    INIT_MODEL = "init_model"        # 模型已加载
-    RUNNING = "running"              # 正在运行推理
-    RELEASED = "released"            # 已释放，等待重置
-    FAILED = "failed"                # 失败，需要重建
+
+    IDLE = "idle"  # 空闲，可被租用
+    LEASED = "leased"  # 已租用，等待初始化
+    INIT_DEVICE = "init_device"  # 设备已初始化（NCCL/HCCl 已初始化）
+    INIT_MODEL = "init_model"  # 模型已加载
+    RUNNING = "running"  # 正在运行推理
+    RELEASED = "released"  # 已释放，等待重置
+    FAILED = "failed"  # 失败，需要重建
 
 
 class ExternalWorkerActor:
     """
     Pre-started Ray Actor that binds to a GPU/NPU device.
-    
+
     This actor performs minimal initialization at creation time:
     1. Binds to the specified GPU/NPU device
     2. Imports common libraries (torch, vllm, etc.)
     3. Optionally warms up NCCL/HCCl for faster subsequent initialization
-    
+
     The actor can then be acquired by an ExternalExecutor to serve as a
     worker in a vLLM instance.
-    
+
     Note: This class is designed to be used with @ray.remote decorator.
     The actual Ray actor creation is handled by ActorPoolManager.
     """
-    
+
     def __init__(
         self,
         device_id: int,
@@ -52,7 +53,7 @@ class ExternalWorkerActor:
     ):
         """
         Initialize the ExternalWorkerActor.
-        
+
         Args:
             device_id: The GPU/NPU device ID to bind to
             warmup_distributed: Whether to warm up NCCL/HCCl at init time
@@ -67,29 +68,29 @@ class ExternalWorkerActor:
         self.device_id = device_id
         self.actor_id = actor_id
         self.fault_domain = fault_domain
-        
+
         # 2. Import common libraries (warm up imports)
         self._import_common_libraries()
-        
+
         # 3. Optionally warm up distributed
         if warmup_distributed:
             self._warmup_distributed()
-        
+
         # 4. Initialize state
         self.worker = None
         self.vllm_config = None
         self.state = ActorState.IDLE
-        
+
         # For distributed initialization
         self._dist_init_store = None
-        
+
         # For switch_model: saved init kwargs (survive worker rebuilds)
         self._rank: int | None = None
         self._local_rank: int | None = None
         self._dist_init_method: str | None = None
         self._is_driver_worker: bool = False
         self._is_driver_node: bool = False
-        
+
         # Active weight source (for migration rollback: re-load the previous
         # model after a failed switch).
         self._active_checkpoint_path: str | None = None
@@ -99,7 +100,7 @@ class ExternalWorkerActor:
         # Mooncake store handle for the RDMA KV transport (lazy init).
         self._mooncake_store = None
         self._mooncake_store_config: dict | None = None
-        
+
         # Message queues (set during initialize_worker)
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
@@ -108,30 +109,25 @@ class ExternalWorkerActor:
         # exits cleanly before the actor is returned to the pool.
         self._stop_event = threading.Event()
         self._loop_thread: threading.Thread | None = None
-    
+
     def _import_common_libraries(self):
         """Import common libraries to speed up subsequent initialization."""
         # Pooled actors create one continuous usage reporter per engine.
         # Disable telemetry here so repeated model reloads cannot accumulate
         # unbounded reporter threads or block shutdown on network I/O.
         os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
-        import torch.distributed as dist
-        import vllm
-        from vllm.v1.worker.worker_base import WorkerWrapperBase
-        from vllm.distributed.device_communicators.shm_broadcast import (
-            MessageQueue, Handle
-        )
-    
+
     def _warmup_distributed(self):
         """
         Warm up NCCL/HCCl by creating and destroying a temporary ProcessGroup.
-        
+
         This speeds up subsequent distributed initialization because the
         NCCL/HCCl library is already loaded and initialized.
         """
         import torch.distributed as dist
+
         from vllm.platforms import current_platform
-        
+
         try:
             # Create a temporary TCPStore
             store = dist.TCPStore(
@@ -141,7 +137,7 @@ class ExternalWorkerActor:
                 is_master=True,
                 wait_for_workers=False,
             )
-            
+
             # Initialize process group
             dist.init_process_group(
                 backend=current_platform.dist_backend,
@@ -149,27 +145,28 @@ class ExternalWorkerActor:
                 world_size=1,
                 rank=0,
             )
-            
+
             # Immediately destroy
             dist.destroy_process_group()
-            
+
             # Cleanup
             del store
-            
+
         except Exception as e:
             # Warmup is optional, don't fail if it doesn't work
             import logging
-            logging.warning(f"Distributed warmup failed: {e}")
-    
+
+            logging.warning("Distributed warmup failed: %s", e)
+
     def wait_for_ready(self) -> dict:
         """
         Wait for actor to be ready and return basic info.
-        
+
         Returns:
             Dictionary with device_id, node_id, physical_gpu_ids, state
         """
         import ray
-        
+
         return {
             "actor_id": self.actor_id,
             "device_id": self.device_id,
@@ -178,17 +175,17 @@ class ExternalWorkerActor:
             "fault_domain": self.fault_domain,
             "state": self.state.value,
         }
-    
+
     def get_info(self) -> dict:
         """
         Get actor information for pool management.
-        
+
         Returns:
             Dictionary with actor_id, device_id, node_id, physical_gpu_ids,
             fault_domain, state
         """
         import ray
-        
+
         return {
             "actor_id": self.actor_id,
             "device_id": self.device_id,
@@ -197,7 +194,7 @@ class ExternalWorkerActor:
             "fault_domain": self.fault_domain,
             "state": self.state.value,
         }
-    
+
     def heartbeat(self) -> dict:
         """
         Return a lightweight liveness + status probe.
@@ -205,9 +202,10 @@ class ExternalWorkerActor:
         Used by the pool manager's heartbeat thread and by the central
         registry to detect dead actors without importing vLLM internals.
         """
-        import ray
         import time
-        
+
+        import ray
+
         return {
             "actor_id": self.actor_id,
             "node_id": ray.get_runtime_context().get_node_id(),
@@ -216,7 +214,7 @@ class ExternalWorkerActor:
             "state": self.state.value,
             "timestamp": time.time(),
         }
-    
+
     def configure_pool_identity(
         self,
         actor_id: str,
@@ -231,34 +229,35 @@ class ExternalWorkerActor:
         self.actor_id = actor_id
         if fault_domain is not None:
             self.fault_domain = fault_domain
-    
+
     def get_node_and_physical_gpu_ids(self) -> tuple:
         """
         Return (node_id, physical_gpu_ids) for this actor.
-        
+
         This method is compatible with RayExecutorV2's interface.
-        
+
         Returns:
             Tuple of (node_id, physical_gpu_ids)
         """
         import ray
+
         from vllm.platforms import current_platform
-        
+
         node_id = ray.get_runtime_context().get_node_id()
         device_key = current_platform.ray_device_key
-        
+
         if not device_key:
             raise RuntimeError(
                 f"current platform {current_platform.device_name} does not support ray."
             )
-        
+
         physical_gpu_ids = ray.get_runtime_context().get_accelerator_ids()[device_key]
-        
+
         return node_id, [
             current_platform.device_control_id_to_physical_device_id(str(x))
             for x in physical_gpu_ids
         ]
-    
+
     def initialize_worker(
         self,
         vllm_config,
@@ -282,8 +281,8 @@ class ExternalWorkerActor:
             input_shm_handle: Shared memory handle for broadcast MessageQueue
             is_driver_node: Whether this actor is on the driver node
         """
-        from vllm.v1.worker.worker_base import WorkerWrapperBase
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+        from vllm.v1.worker.worker_base import WorkerWrapperBase
 
         self.vllm_config = vllm_config
         self._is_driver_node = is_driver_node
@@ -303,6 +302,7 @@ class ExternalWorkerActor:
         )
 
         import ray
+
         n_local = 1 if is_driver_node else 0
         self.worker_response_mq = MessageQueue(
             n_reader=1,
@@ -334,6 +334,7 @@ class ExternalWorkerActor:
 
         import ray
         from torch.distributed import TCPStore
+
         from vllm.utils.network_utils import get_distributed_init_method
 
         host = ray.util.get_node_ip_address()
@@ -350,11 +351,11 @@ class ExternalWorkerActor:
         self._dist_init_store = store
 
         return get_distributed_init_method(host, store.port)
-    
+
     def init_device(self) -> None:
         """
         Initialize device (distributed environment).
-        
+
         Calls Worker.init_device() which:
         - Sets GPU device
         - Initializes NCCL/HCCl
@@ -363,57 +364,58 @@ class ExternalWorkerActor:
         """
         self.worker.init_device()
         self.state = ActorState.INIT_DEVICE
-    
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """
         Load model weights.
-        
+
         Args:
             load_dummy_weights: If True, load dummy weights instead of real weights
         """
         self.worker.load_model(load_dummy_weights=load_dummy_weights)
         self.state = ActorState.INIT_MODEL
-    
+
     def load_model_via_weight_transfer(
         self,
         weight_transfer_init_info: dict,
     ) -> None:
         """
         Load model via weight_transfer mechanism.
-        
+
         Flow:
         1. Create model structure (with dummy weights)
         2. Initialize weight_transfer engine
         3. Pull real weights via weight_transfer
-        
+
         Args:
             weight_transfer_init_info: Initialization info for weight_transfer engine
         """
         # 1. Load dummy model (create model structure)
         self.worker.load_model(load_dummy_weights=True)
-        
+
         # 2. Initialize weight_transfer engine
         model = self.worker.get_model()
         device = self.worker.device
         weight_transfer_config = self.vllm_config.weight_transfer_config
-        
+
         from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+
         engine = WeightTransferEngineFactory.create_engine(
             weight_transfer_config, self.vllm_config, device, model
         )
         self.worker.weight_transfer_engine = engine
-        
+
         # 3. Initialize transfer mechanism
         init_info = engine.parse_init_info(weight_transfer_init_info)
         engine.init_transfer_engine(init_info)
-        
+
         # 4. Wait for and receive weights (triggered by external trainer)
         engine.start_weight_update()
         # update_weights will be called externally
         engine.finish_weight_update()
-        
+
         self.state = ActorState.INIT_MODEL
-    
+
     def load_model_from_storage(
         self,
         checkpoint_path: str,
@@ -422,47 +424,49 @@ class ExternalWorkerActor:
     ) -> None:
         """
         Load model weights from persistent storage.
-        
+
         This method uses StorageCheckpointEngine (compatible with verl's
         CheckpointEngineWithCache interface) to load weights from storage
         backends like NFS or Mooncake Store.
-        
+
         Flow:
         1. Create model structure (with dummy weights)
         2. Create StorageCheckpointEngine
         3. Load weights from storage and update model parameters
-        
+
         Args:
             checkpoint_path: Logical path for the checkpoint in storage
             storage_backend: Storage backend name ("nfs" or "mooncake")
             storage_config: Backend-specific configuration
         """
         import logging
+
         logger = logging.getLogger(__name__)
-        
+
         # 1. Load dummy model (create model structure)
         logger.info(
-            f"Loading model from storage: checkpoint={checkpoint_path}, "
-            f"backend={storage_backend}"
+            "Loading model from storage: checkpoint=%s, backend=%s",
+            checkpoint_path,
+            storage_backend,
         )
         self.worker.load_model(load_dummy_weights=True)
-        
+
         # 2. Create StorageCheckpointEngine
         from vllm_external_executor.storage_checkpoint_engine import (
             StorageCheckpointEngine,
         )
-        
+
         engine = StorageCheckpointEngine(
             backend=storage_backend,
             config=storage_config or {},
             device=str(self.worker.device),
         )
         engine.set_checkpoint(checkpoint_path)
-        
+
         # 3. Load weights from storage and update model
         model = self.worker.get_model()
         loaded_count = 0
-        
+
         for name, tensor in engine.get_weights():
             try:
                 param = model.get_parameter(name)
@@ -472,19 +476,17 @@ class ExternalWorkerActor:
                 param.data.copy_(tensor)
                 loaded_count += 1
             except AttributeError:
-                logger.warning(f"Parameter {name} not found in model, skipping")
-        
-        logger.info(
-            f"Loaded {loaded_count} parameters from storage checkpoint"
-        )
-        
+                logger.warning("Parameter %s not found in model, skipping", name)
+
+        logger.info("Loaded %d parameters from storage checkpoint", loaded_count)
+
         # Record the active weight source for migration rollback.
         self._active_checkpoint_path = checkpoint_path
         self._active_storage_backend = storage_backend
         self._active_storage_config = storage_config
-        
+
         self.state = ActorState.INIT_MODEL
-    
+
     def switch_model(
         self,
         vllm_config,
@@ -495,62 +497,63 @@ class ExternalWorkerActor:
     ) -> None:
         """
         Switch to a new model (hot-switching).
-        
+
         Releases the current model and KV cache, rebuilds the worker with
         the new vllm_config, then loads the new weights from the chosen
         source. MessageQueues are retained (they are owned by the executor)
         and the distributed environment is reused when world_size is
         unchanged (init_distributed_environment is idempotent).
-        
+
         Args:
             vllm_config: New vLLM configuration
             checkpoint_path: Checkpoint path for storage loading (optional)
             storage_backend: Storage backend name ("nfs" or "mooncake")
             storage_config: Backend-specific configuration
             weight_transfer_init_info: Weight transfer init info (optional)
-        
+
         Raises:
             RuntimeError: If the worker has not been initialized
         """
         import logging
+
         logger = logging.getLogger(__name__)
-        
+
         if self.worker is None or self.vllm_config is None:
-            raise RuntimeError(
-                "Worker not initialized, cannot switch model"
-            )
-        
+            raise RuntimeError("Worker not initialized, cannot switch model")
+
         logger.info(
-            f"Switching model on worker {self._rank} (device {self.device_id})"
+            "Switching model on worker %s (device %s)", self._rank, self.device_id
         )
-        
+
         # 1. Release the current model and KV cache (keep device binding)
         self.worker.shutdown()
         self.worker = None
         self.state = ActorState.RELEASED
-        
+
         # 2. Rebuild worker with the new config (reuse saved init kwargs)
         from vllm.v1.worker.worker_base import WorkerWrapperBase
-        
+
         self.vllm_config = vllm_config
-        wrapper = WorkerWrapperBase(
-            rpc_rank=self._local_rank, global_rank=self._rank
+        wrapper = WorkerWrapperBase(rpc_rank=self._local_rank, global_rank=self._rank)
+        wrapper.init_worker(
+            all_kwargs=[
+                {
+                    "vllm_config": vllm_config,
+                    "local_rank": self._local_rank,
+                    "rank": self._rank,
+                    "distributed_init_method": self._dist_init_method,
+                    "is_driver_worker": self._is_driver_worker,
+                }
+            ]
         )
-        wrapper.init_worker(all_kwargs=[{
-            "vllm_config": vllm_config,
-            "local_rank": self._local_rank,
-            "rank": self._rank,
-            "distributed_init_method": self._dist_init_method,
-            "is_driver_worker": self._is_driver_worker,
-        }])
         self.worker = wrapper
-        
+
         # 3. Re-initialize device. init_distributed_environment is
         #    idempotent (skips PG init when already initialized), and
         #    ensure_model_parallel_initialized no-ops for existing groups,
         #    so this is safe for the same-world_size hot-switch.
         self.worker.init_device()
-        
+
         # 4. Load the new model weights
         if checkpoint_path is not None:
             self.load_model_from_storage(
@@ -567,12 +570,10 @@ class ExternalWorkerActor:
             self._active_checkpoint_path = None
             self._active_storage_backend = "nfs"
             self._active_storage_config = None
-        
+
         self.state = ActorState.INIT_MODEL
-        logger.info(
-            f"Worker {self._rank} switched to new model successfully"
-        )
-    
+        logger.info("Worker %s switched to new model successfully", self._rank)
+
     def switch_model_snapshot(self) -> dict:
         """Capture the pre-migration state for atomic rollback.
 
@@ -586,7 +587,7 @@ class ExternalWorkerActor:
             "storage_backend": self._active_storage_backend,
             "storage_config": self._active_storage_config,
         }
-    
+
     def switch_model_rollback(self, snapshot: dict) -> None:
         """Rollback a failed switch by re-loading the previous model.
 
@@ -599,7 +600,7 @@ class ExternalWorkerActor:
             storage_backend=snapshot["storage_backend"],
             storage_config=snapshot["storage_config"],
         )
-    
+
     # ======================================================== KV-block transfer
     def export_kv_blocks(self, block_ids: list[int]) -> list[dict]:
         """Slice the given KV blocks out of this worker's KV caches.
@@ -628,7 +629,7 @@ class ExternalWorkerActor:
                 shards[gidx] = cache[block_id]
             payloads.append({"block_id": block_id, "shards": shards})
         return payloads
-    
+
     def import_kv_blocks(self, payloads: list[dict]) -> int:
         """Write exported KV blocks back into this worker's KV caches.
 
@@ -698,9 +699,7 @@ class ExternalWorkerActor:
         caches = self._get_kv_caches()
         count = 0
         for handle in handles:
-            dst_id = (block_mapping or {}).get(
-                handle["block_id"], handle["block_id"]
-            )
+            dst_id = (block_mapping or {}).get(handle["block_id"], handle["block_id"])
             for gidx, ipc_bytes in handle["ipc_handles"].items():
                 mapped = torch.from_ipc_handle(
                     ipc_bytes,
@@ -769,9 +768,7 @@ class ExternalWorkerActor:
         self._mooncake_store = store
         return store
 
-    def export_kv_blocks_to_store(
-        self, block_ids: list[int]
-    ) -> list[dict]:
+    def export_kv_blocks_to_store(self, block_ids: list[int]) -> list[dict]:
         """Export KV blocks and stage them in the Mooncake store.
 
         Each block payload is serialized (the group shards included) and
@@ -829,9 +826,7 @@ class ExternalWorkerActor:
                     f"KV block not found in store: {key['store_key']}"
                 )
             payload = torch.load(io.BytesIO(raw), map_location="cpu")
-            dst_id = (block_mapping or {}).get(
-                key["block_id"], key["block_id"]
-            )
+            dst_id = (block_mapping or {}).get(key["block_id"], key["block_id"])
             for gidx, tensor in payload["shards"].items():
                 caches[gidx][dst_id].copy_(tensor)
             count += 1
@@ -850,7 +845,7 @@ class ExternalWorkerActor:
         if not caches:
             raise RuntimeError("KV caches are not initialized on this worker")
         return caches
-    
+
     def get_kv_cache_metadata(self) -> dict:
         """Return structural KV cache metadata (for capacity planning)."""
         caches = self._get_kv_caches()
@@ -859,30 +854,30 @@ class ExternalWorkerActor:
             "num_blocks": int(caches[0].shape[0]) if caches else 0,
             "block_size": int(caches[0].shape[1]) if caches else 0,
         }
-    
+
     def initialize_kv_cache(self, kv_cache_config) -> None:
         """
         Initialize KV Cache.
-        
+
         Args:
             kv_cache_config: KV Cache configuration
         """
         self.worker.initialize_kv_cache(kv_cache_config)
-    
+
     def determine_available_memory(self) -> int:
         """
         Determine available memory for KV Cache.
-        
+
         Returns:
             Available memory in bytes
         """
         return self.worker.determine_available_memory()
-    
+
     def compile_or_warm_up_model(self) -> None:
         """Compile/warm up model (CUDA Graph, kernel warmup, etc.)."""
         self.worker.compile_or_warm_up_model()
         self.state = ActorState.RUNNING
-    
+
     def wait_for_init(self) -> dict:
         """
         Report init status; READY is published only after the worker and its
@@ -909,7 +904,7 @@ class ExternalWorkerActor:
             "status": "READY",
             "handle": self.worker_response_mq.export_handle(),
         }
-    
+
     def run(self) -> None:
         """Start the worker busy loop on a background thread.
 
@@ -946,7 +941,7 @@ class ExternalWorkerActor:
             except TimeoutError:
                 continue
             self._execute_worker_rpc(rpc_request)
-    
+
     def _execute_worker_rpc(self, rpc_request) -> None:
         """Execute one RPC and reply over the response MQ.
 
@@ -957,6 +952,7 @@ class ExternalWorkerActor:
         is the target rank, matching the driver-side ``collective_rpc`` parser.
         """
         import logging
+
         logger = logging.getLogger(__name__)
         from vllm.v1.executor.multiproc_executor import WorkerProc
 
@@ -967,7 +963,9 @@ class ExternalWorkerActor:
                 func = getattr(self.worker, method)
             elif isinstance(method, bytes):
                 from functools import partial
+
                 import cloudpickle
+
                 func = partial(cloudpickle.loads(method), self.worker)
             else:
                 raise TypeError(f"Unsupported RPC method type: {type(method)}")
@@ -979,11 +977,12 @@ class ExternalWorkerActor:
         except Exception as e:
             if hasattr(e, "add_note"):
                 import traceback
+
                 e.add_note(traceback.format_exc())
             logger.exception("Worker RPC failed: %s", method)
             if output_rank is None or self._rank == output_rank:
                 WorkerProc.enqueue_output(self, e)
-    
+
     def reset(self) -> None:
         """Stop execution and release task resources before returning to IDLE."""
         if self.state == ActorState.FAILED:
@@ -1006,11 +1005,11 @@ class ExternalWorkerActor:
 
     def _release_worker_resources(self) -> None:
         import gc
+        import sys
 
         from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
         from vllm.logger import init_logger
         from vllm.platforms import current_platform
-
         from vllm_external_executor.mq_cleanup import close_message_queue
 
         logger = init_logger("vllm.external_worker_actor")
@@ -1067,6 +1066,10 @@ class ExternalWorkerActor:
 
         # Ordinary workers exit their process. Pooled workers must explicitly
         # release global process groups and collect frozen/cyclic model objects.
+        if current_platform.device_type == "npu":
+            ascend_parallel = sys.modules.get("vllm_ascend.distributed.parallel_state")
+            if ascend_parallel is not None:
+                ascend_parallel.destroy_ascend_model_parallel()
         cleanup_dist_env_and_memory(shutdown_ray=False)
         # Drop the TCPStore after the process group is destroyed and force a GC
         # so the master daemon's listen socket closes now, not on a later
@@ -1209,7 +1212,8 @@ class ExternalWorkerActor:
                 kind = f"{type(owner).__module__}.{type(owner).__qualname__}"
                 if isinstance(owner, dict):
                     keys = [
-                        key[:80] for key, value in owner.items()
+                        key[:80]
+                        for key, value in owner.items()
                         if value is obj and isinstance(key, str)
                     ][:8]
                     kind += f" keys={keys}"
@@ -1231,7 +1235,9 @@ class ExternalWorkerActor:
             obj = ref()
             logger.warning(
                 "Actor %s after reset: %s alive=%s",
-                self.actor_id, name, obj is not None,
+                self.actor_id,
+                name,
+                obj is not None,
             )
             if obj is not None:
                 visit(obj, name, 10)
@@ -1295,7 +1301,9 @@ class ExternalWorkerActor:
             for wrapper in list(getattr(acl_graph, "_acl_graph_wrappers", ())):
                 wrapper.concrete_aclgraph_entries.clear()
             for name in (
-                "_graph_params", "_draft_graph_params", "_draft_graph_prefill_params"
+                "_graph_params",
+                "_draft_graph_params",
+                "_draft_graph_prefill_params",
             ):
                 params = getattr(acl_graph, name, None)
                 if params is not None:

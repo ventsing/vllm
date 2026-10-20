@@ -164,6 +164,7 @@ def test_reset_collects_runner_and_layer_cache_before_device_cache_eviction(
 
     actor = object.__new__(_module.ExternalWorkerActor)
     actor.actor_id = "test-actor"
+    actor._dist_init_store = None
     actor.state = _module.ActorState.RUNNING
     actor._stop_event = Event()
     actor._loop_thread = None
@@ -179,6 +180,16 @@ def test_reset_collects_runner_and_layer_cache_before_device_cache_eviction(
 
     # PyTorch AOT constructs a private globals copy, not the module dictionary.
     model_module = ModuleType("pooled_test_model")
+    ascend_parallel = ModuleType("vllm_ascend.distributed.parallel_state")
+    ascend_parallel._MC2 = object()
+
+    def destroy_ascend_groups():
+        ascend_parallel._MC2 = None
+
+    ascend_parallel.destroy_ascend_model_parallel = Mock(
+        side_effect=destroy_ascend_groups
+    )
+    monkeypatch.setitem(sys.modules, ascend_parallel.__name__, ascend_parallel)
     globals_copy = dict(vars(model_module))
     owned = SerializableFunction(
         example_inputs=[runner.model, runner.kv_caches[0]],
@@ -228,6 +239,7 @@ def test_reset_collects_runner_and_layer_cache_before_device_cache_eviction(
         assert all(ref() is None for ref in refs)
 
     device_module = SimpleNamespace(
+        is_available=lambda: False,
         synchronize=Mock(),
         memory_allocated=lambda: 0,
         memory_reserved=lambda: 0,
@@ -237,8 +249,14 @@ def test_reset_collects_runner_and_layer_cache_before_device_cache_eviction(
     monkeypatch.setattr(current_platform, "device_type", device_type)
     monkeypatch.setattr(current_platform, "set_device", lambda device: None)
     monkeypatch.setattr(_module.torch, device_type, device_module, raising=False)
+
+    def cleanup_distributed(**kwargs):
+        if device_type == "npu":
+            assert ascend_parallel._MC2 is None
+        gc.collect()
+
     monkeypatch.setattr(
-        parallel_state, "cleanup_dist_env_and_memory", lambda **kwargs: gc.collect()
+        parallel_state, "cleanup_dist_env_and_memory", cleanup_distributed
     )
     monkeypatch.setattr(workspace, "reset_workspace_manager", lambda: None)
 
@@ -254,12 +272,17 @@ def test_reset_collects_runner_and_layer_cache_before_device_cache_eviction(
     assert artifacts.guard_manager is None
     device_module.empty_cache.assert_called_once()
     if device_type == "npu":
+        ascend_parallel.destroy_ascend_model_parallel.assert_called_once()
         assert graph_module._graph_params is None
         assert graph_module._draft_graph_params is None
         assert graph_module._draft_graph_prefill_params is None
         assert wrapper.concrete_aclgraph_entries == {}
     actor.reset()
     assert actor.state == _module.ActorState.IDLE
+    if device_type == "npu":
+        assert ascend_parallel.destroy_ascend_model_parallel.call_count == 2
+    else:
+        ascend_parallel.destroy_ascend_model_parallel.assert_not_called()
 
 
 def test_reset_diagnostics_identify_holder_without_keeping_model_alive():

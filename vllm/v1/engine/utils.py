@@ -216,6 +216,20 @@ class CoreEngineProcManager:
             process_target = _run_engine_core_with_external_actors
 
         self.processes: list[BaseProcess] = []
+        from vllm.v1.engine.process_pool import get_active_engine_core_pool
+
+        engine_core_pool = get_active_engine_core_pool()
+        if engine_core_pool is not None and (
+            external_actors is None
+            or is_dp
+            or local_engine_count != 1
+            or tensor_queue is not None
+            or vllm_config.parallel_config.numa_bind
+        ):
+            raise ValueError(
+                "Prewarmed EngineCore requires external actors, DP=1, "
+                "no tensor queue, and no NUMA binding"
+            )
         local_dp_ranks = []
         for index in range(local_engine_count):
             local_index = local_start_index + index
@@ -223,14 +237,22 @@ class CoreEngineProcManager:
 
             # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
-            self.processes.append(
-                context.Process(
-                    target=process_target,
-                    name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
-                    kwargs=common_kwargs
-                    | {"dp_rank": global_index, "local_dp_rank": local_index},
+            process_kwargs = common_kwargs | {
+                "dp_rank": global_index,
+                "local_dp_rank": local_index,
+            }
+            process_name = f"EngineCore_DP{global_index}" if is_dp else "EngineCore"
+            if engine_core_pool is not None:
+                process = engine_core_pool.prepare(
+                    process_target, process_name, process_kwargs
                 )
-            )
+            else:
+                process = context.Process(
+                    target=process_target,
+                    name=process_name,
+                    kwargs=process_kwargs,
+                )
+            self.processes.append(process)
 
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
         self.manager_stopped = threading.Event()

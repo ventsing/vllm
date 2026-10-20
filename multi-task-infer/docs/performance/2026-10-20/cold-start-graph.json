@@ -1,0 +1,12 @@
+{
+  "backend": "cold",
+  "mode": "graph",
+  "disable_compile_cache": true,
+  "status": "passed",
+  "ready_seconds": 76.98815715312958,
+  "driver_to_ready_seconds": 92.03319257684052,
+  "first_token_seconds": 77.48544271662831,
+  "first_request_seconds": 77.56866365112364,
+  "output": " Paris.\nThe capital of France is",
+  "shutdown_seconds": 7.5993141401559114
+}

@@ -1,0 +1,165 @@
+{
+  "summary": {
+    "total": {
+      "count": 8,
+      "mean": 16.52743592718616,
+      "min": 15.676987882703543,
+      "max": 18.728108689188957
+    },
+    "frontend_dispatch": {
+      "count": 8,
+      "mean": 3.728570371866226,
+      "min": 3.069847345352173,
+      "max": 5.961434841156006
+    },
+    "executor_model": {
+      "count": 8,
+      "mean": 4.386249989271164,
+      "min": 3.559999942779541,
+      "max": 5.269999980926514
+    },
+    "profile_kv_warmup": {
+      "count": 8,
+      "mean": 6.6137500000000005,
+      "min": 6.17,
+      "max": 7.73
+    },
+    "ready_tail": {
+      "count": 8,
+      "mean": 1.7988655269145966,
+      "min": 1.4421906471252441,
+      "max": 2.2738049030303955
+    },
+    "logged_compilation": {
+      "count": 8,
+      "mean": 0.46375,
+      "min": 0.42,
+      "max": 0.64
+    },
+    "model_load_max_rank": {
+      "count": 8,
+      "mean": 3.71875,
+      "min": 3.49,
+      "max": 4.33
+    },
+    "weights_load_max_rank": {
+      "count": 8,
+      "mean": 2.0925,
+      "min": 1.87,
+      "max": 2.33
+    },
+    "capture_max_rank": {
+      "count": 8,
+      "mean": 1.125,
+      "min": 1.0,
+      "max": 2.0
+    }
+  },
+  "samples": [
+    {
+      "slot": 0,
+      "pid": 222305,
+      "total": 18.728108689188957,
+      "frontend_dispatch": 5.961434841156006,
+      "executor_model": 4.130000114440918,
+      "profile_kv_warmup": 6.87,
+      "ready_tail": 1.7666738033294678,
+      "logged_compilation": 0.43,
+      "model_load_max_rank": 3.62,
+      "weights_load_max_rank": 1.87,
+      "capture_max_rank": 1.0
+    },
+    {
+      "slot": 1,
+      "pid": 222303,
+      "total": 15.88327026553452,
+      "frontend_dispatch": 3.2312099933624268,
+      "executor_model": 4.829999923706055,
+      "profile_kv_warmup": 6.17,
+      "ready_tail": 1.6520602703094482,
+      "logged_compilation": 0.44,
+      "model_load_max_rank": 3.53,
+      "weights_load_max_rank": 1.93,
+      "capture_max_rank": 1.0
+    },
+    {
+      "slot": 2,
+      "pid": 222301,
+      "total": 16.508041827008128,
+      "frontend_dispatch": 3.345842123031616,
+      "executor_model": 4.450000047683716,
+      "profile_kv_warmup": 6.55,
+      "ready_tail": 2.1621997356414795,
+      "logged_compilation": 0.42,
+      "model_load_max_rank": 3.67,
+      "weights_load_max_rank": 2.11,
+      "capture_max_rank": 1.0
+    },
+    {
+      "slot": 3,
+      "pid": 222306,
+      "total": 15.76341199874878,
+      "frontend_dispatch": 3.835425615310669,
+      "executor_model": 3.559999942779541,
+      "profile_kv_warmup": 6.44,
+      "ready_tail": 1.9279863834381104,
+      "logged_compilation": 0.44,
+      "model_load_max_rank": 3.6,
+      "weights_load_max_rank": 2.18,
+      "capture_max_rank": 1.0
+    },
+    {
+      "slot": 4,
+      "pid": 222304,
+      "total": 15.676987882703543,
+      "frontend_dispatch": 3.069847345352173,
+      "executor_model": 4.519999980926514,
+      "profile_kv_warmup": 6.48,
+      "ready_tail": 1.6071405410766602,
+      "logged_compilation": 0.45,
+      "model_load_max_rank": 3.49,
+      "weights_load_max_rank": 2.01,
+      "capture_max_rank": 1.0
+    },
+    {
+      "slot": 5,
+      "pid": 222308,
+      "total": 17.949481120333076,
+      "frontend_dispatch": 3.390613079071045,
+      "executor_model": 5.269999980926514,
+      "profile_kv_warmup": 7.73,
+      "ready_tail": 1.5588679313659668,
+      "logged_compilation": 0.64,
+      "model_load_max_rank": 4.33,
+      "weights_load_max_rank": 2.04,
+      "capture_max_rank": 2.0
+    },
+    {
+      "slot": 6,
+      "pid": 222307,
+      "total": 15.880682500079274,
+      "frontend_dispatch": 3.4384918212890625,
+      "executor_model": 4.5899999141693115,
+      "profile_kv_warmup": 6.41,
+      "ready_tail": 1.4421906471252441,
+      "logged_compilation": 0.44,
+      "model_load_max_rank": 3.72,
+      "weights_load_max_rank": 2.27,
+      "capture_max_rank": 1.0
+    },
+    {
+      "slot": 7,
+      "pid": 222302,
+      "total": 15.829503133893013,
+      "frontend_dispatch": 3.5556981563568115,
+      "executor_model": 3.740000009536743,
+      "profile_kv_warmup": 6.26,
+      "ready_tail": 2.2738049030303955,
+      "logged_compilation": 0.45,
+      "model_load_max_rank": 3.79,
+      "weights_load_max_rank": 2.33,
+      "capture_max_rank": 1.0
+    }
+  ],
+  "limitations": "Cross-process timestamps have one-second resolution; model/compile/capture timings are nested, not additive."
+}

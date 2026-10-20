@@ -202,7 +202,7 @@ def test_external_actor_handles_deserialize_after_ray_connect(monkeypatch, conne
     """A spawned engine must join Ray before unpickling pooled actor handles."""
     import sys
 
-    events = []
+    events: list[str] = []
     actors = [object()]
 
     def init(**kwargs):
@@ -239,3 +239,96 @@ def test_external_actor_handles_deserialize_after_ray_connect(monkeypatch, conne
         dp_rank=0,
     )
     assert events == expected
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_prewarmed_core_waits_for_configuration_and_honors_cancellation(
+    monkeypatch, cancel
+):
+    import sys
+
+    from vllm import envs, plugins
+    from vllm.v1.engine import process_pool
+
+    events: list[str] = []
+
+    def execute(**kwargs):
+        assert kwargs == {"configuration": "assigned"}
+        assert events[-1] == "close"
+        events.append("engine")
+
+    def receive():
+        assert "ready" in events and "engine" not in events
+        events.append("receive")
+        return b"" if cancel else b"configuration"
+
+    channel = SimpleNamespace(
+        send=lambda message: events.append(message[0]),
+        recv_bytes=receive,
+        close=lambda: events.append("close"),
+    )
+    monkeypatch.setattr(
+        process_pool.importlib, "import_module", lambda name: events.append(name)
+    )
+    monkeypatch.setattr(
+        plugins, "load_general_plugins", lambda: events.append("plugins")
+    )
+    monkeypatch.setattr(envs, "disable_envs_cache", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        SimpleNamespace(
+            init=lambda **kwargs: events.append("ray"),
+            cloudpickle=SimpleNamespace(
+                loads=lambda payload: (execute, {"configuration": "assigned"}, {})
+            ),
+        ),
+    )
+    process_pool._warm_engine_entry(channel, "cluster", "pool", ("extra.module",))
+
+    assert events[:4] == ["vllm.v1.engine.core", "plugins", "extra.module", "ray"]
+    assert events[-1] == ("close" if cancel else "engine")
+
+
+def test_prepared_core_is_single_use_and_preserves_process_monitoring(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.v1.engine import process_pool
+
+    monkeypatch.setattr(
+        process_pool,
+        "get_mp_context",
+        lambda: SimpleNamespace(get_start_method=lambda: "spawn"),
+    )
+    pool = process_pool.EngineCoreProcessPool(1, "cluster", "pool")
+    process = SimpleNamespace(pid=1234, sentinel=42, is_alive=lambda: True)
+    channel = SimpleNamespace(send_bytes=Mock(), close=Mock())
+    pool._ready.append((process, channel))
+    monkeypatch.setattr(pool, "_replenish", Mock())
+
+    prepared = pool.prepare(
+        lambda: None, "EngineCore", {"ray_address": "cluster", "ray_namespace": "pool"}
+    )
+    assert prepared.pid == 1234 and prepared.sentinel == 42
+    assert pool.idle_pids() == []
+    channel.send_bytes.assert_not_called()
+    prepared.start()
+    with pytest.raises(RuntimeError, match="only start once"):
+        prepared.start()
+    channel.send_bytes.assert_called_once()
+    channel.close.assert_called_once()
+    pool._replenish.assert_called_once()
+
+
+def test_prewarmed_core_rejects_environment_changes_before_leasing(monkeypatch):
+    from vllm.v1.engine import process_pool
+
+    monkeypatch.setattr(
+        process_pool,
+        "get_mp_context",
+        lambda: SimpleNamespace(get_start_method=lambda: "spawn"),
+    )
+    pool = process_pool.EngineCoreProcessPool(1, "cluster", "pool")
+    monkeypatch.setenv("VLLM_PLUGINS", "different-plugins")
+    with pytest.raises(RuntimeError, match="environment changed"):
+        pool.prepare(lambda: None, "EngineCore", {})
