@@ -304,15 +304,27 @@ class ExternalExecutor(RayExecutorV2):
             )
             self.ray_worker_handles.append(handle)
         
-        # Step 2: Create MessageQueue (same as RayExecutorV2). Worker
-        # grouping by node happens inline in Step 4 (node_workers below) so
-        # local_rank reflects per-node ordering.
+        self._init_worker_group()
+
+        logger.info("ExternalExecutor initialization complete")
+
+    def _init_worker_group(self, *, use_switch: bool = False) -> None:
+        """Create MQs, initialize workers, and load the model.
+
+        Shared by :meth:`_init_executor` (first init, ``use_switch=False``)
+        and :meth:`reconfigure` (hot-switch, ``use_switch=True``). On a switch,
+        each actor tears down its previous model/comm itself via
+        :meth:`ExternalWorkerActor.switch_model_and_topology`; otherwise the
+        fresh :meth:`ExternalWorkerActor.initialize_worker` is used.
+        """
         import ray
         driver_node = ray.get_runtime_context().get_node_id()
-        
+
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
-        n_local = sum(1 for h in self.ray_worker_handles if h.node_id == driver_node)
-        
+        n_local = sum(
+            1 for h in self.ray_worker_handles if h.node_id == driver_node
+        )
+
         self.rpc_broadcast_mq = MessageQueue(
             self.world_size,
             n_local,
@@ -320,14 +332,9 @@ class ExternalExecutor(RayExecutorV2):
             connect_ip=ray.util.get_node_ip_address(),
         )
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
-        
-        # Step 4: Initialize workers
-        # Get distributed init method from the first worker. Pass world_size so
-        # the worker does not need a vllm_config of its own yet (see 2.3).
+
         # file:// rendezvous is only valid when every worker shares one node's
-        # filesystem, so judge by the actual handle spread rather than the
-        # configured nnodes: a world_size larger than one node's device count
-        # lands workers on several nodes and must fall back to a TCPStore.
+        # filesystem; judge by the actual handle spread, not configured nnodes.
         num_nodes = len({h.node_id for h in self.ray_worker_handles})
         distributed_init_method = ray.get(
             self.ray_worker_handles[0].actor.create_dist_init_method.remote(
@@ -335,29 +342,26 @@ class ExternalExecutor(RayExecutorV2):
                 num_nodes,
             )
         )
-        
-        # Discover physical GPU IDs
+
         worker_node_and_physical_gpu_ids = ray.get([
             h.actor.get_node_and_physical_gpu_ids.remote()
             for h in self.ray_worker_handles
         ])
-        
+
         node_workers: dict[str, list[int]] = defaultdict(list)
         node_physical_gpu_ids: dict[str, list[int]] = defaultdict(list)
-        
+
         for i, (node_id, physical_gpu_ids) in enumerate(
             worker_node_and_physical_gpu_ids
         ):
             node_workers[node_id].append(i)
             node_physical_gpu_ids[node_id].extend(physical_gpu_ids)
-        
+
         for node_id in node_physical_gpu_ids:
             node_physical_gpu_ids[node_id] = sorted(node_physical_gpu_ids[node_id])
-        
+
         tp_size = self.parallel_config.tensor_parallel_size
-        
-        # Build the full per-rank kwargs list (same shape as RayExecutorV2) so
-        # every actor can pick its own entry by global rank.
+
         all_kwargs = []
         for rank, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
             local_rank = node_workers[node_id].index(rank)
@@ -371,13 +375,16 @@ class ExternalExecutor(RayExecutorV2):
                 "distributed_init_method": distributed_init_method,
                 "is_driver_worker": rank % tp_size == 0,
             })
-        
-        # Each actor independently initializes, passing the full all_kwargs
-        # with its own rank so rpc_rank and all_kwargs length stay aligned.
+
+        worker_method = (
+            "switch_model_and_topology" if use_switch else "initialize_worker"
+        )
         init_worker_refs = []
         for rank, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
             init_worker_refs.append(
-                self.ray_worker_handles[rank].actor.initialize_worker.remote(
+                getattr(
+                    self.ray_worker_handles[rank].actor, worker_method
+                ).remote(
                     vllm_config=self.vllm_config,
                     rank=rank,
                     all_kwargs=all_kwargs,
@@ -385,21 +392,21 @@ class ExternalExecutor(RayExecutorV2):
                     is_driver_node=(node_id == driver_node),
                 )
             )
-        
-        # Set assigned_physical_gpu_ids on config for consistency
+
+        # Set assigned_physical_gpu_ids on config for consistency.
         if len(node_physical_gpu_ids) == 1:
             node_id_0 = worker_node_and_physical_gpu_ids[0][0]
             self.vllm_config.parallel_config.assigned_physical_gpu_ids = sorted(
                 node_physical_gpu_ids[node_id_0]
             )
-        
+
         ray.get(init_worker_refs)
-        
+
         # Step 5: Collect response MQ handles
         init_results = ray.get([
             h.actor.wait_for_init.remote() for h in self.ray_worker_handles
         ])
-        
+
         self.response_mqs: list[MessageQueue] = []
         for i, result in enumerate(init_results):
             if result["status"] != "READY":
@@ -407,34 +414,31 @@ class ExternalExecutor(RayExecutorV2):
             self.response_mqs.append(
                 MessageQueue.create_from_handle(result["handle"], 0)
             )
-        
+
         # Step 6: Start run() before wait_until_ready()
         for handle in self.ray_worker_handles:
             handle.run()
-        
+
         # Step 7: wait_until_ready() barrier
         self.rpc_broadcast_mq.wait_until_ready()
         for response_mq in self.response_mqs:
             response_mq.wait_until_ready()
-        
+
         from collections import deque
-        from concurrent.futures import Future
+
         self.futures_queue = deque()
-        
+
         self._post_init_executor()
-        
+
         # Step 8: Start worker monitor
         self.start_worker_monitor()
-        
+
         self.output_rank = self._get_output_rank()
 
-        # Initialize on the MQ thread that will execute inference. Each RPC
-        # runs on all ranks concurrently, as required by distributed init.
+        # RPCs run on all ranks concurrently, as required by distributed init.
         self.collective_rpc("init_device")
         self.collective_rpc("load_model")
 
-        logger.info("ExternalExecutor initialization complete")
-    
     def _handle_compilation_optimization(self):
         """
         Handle compilation optimization with lazy-loading pattern (P2).
@@ -645,6 +649,80 @@ class ExternalExecutor(RayExecutorV2):
         
         self.ray_worker_handles = []
         logger.info("Actors released")
+
+    def reconfigure(self, new_vllm_config: VllmConfig, new_actors: list) -> None:
+        """Hot-switch to a new model/topology on the resident actor pool.
+
+        Tears down the current worker group (monitor, executor-side
+        MessageQueues, worker model/comm) and rebuilds it for
+        ``new_vllm_config`` over ``new_actors`` without releasing the actors
+        back to the pool. Each actor tears itself down and re-initializes in
+        one :meth:`ExternalWorkerActor.switch_model_and_topology` RPC, so the
+        communication domain is rebuilt (~300ms on Ascend) and the MQs are
+        recreated for the new ``world_size``.
+        """
+        import ray
+
+        new_world_size = new_vllm_config.parallel_config.world_size
+        if len(new_actors) != new_world_size:
+            raise ValueError(
+                f"new_actors count ({len(new_actors)}) must equal world_size "
+                f"({new_world_size})"
+            )
+        self._validate_mvp_scope(new_vllm_config)
+        if getattr(self, "shutting_down", False):
+            raise RuntimeError("Cannot reconfigure a shutting-down executor")
+
+        # 0. Reset actors that leave this executor (bound now but absent from
+        #    the new topology) so their devices/model are freed and the pool can
+        #    reuse them. Actors present in both sets switch in place instead of
+        #    doing a reset -> re-init round-trip.
+        for handle in getattr(self, "ray_worker_handles", []):
+            if handle.actor not in new_actors:
+                try:
+                    ray.get(handle.actor.reset.remote())
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to reset leaving actor rank=%d: %s",
+                        handle.rank,
+                        exc,
+                    )
+
+        # 1. Stop the liveness monitor before rebuilding the worker group.
+        if stop_event := getattr(self, "_monitor_stop_event", None):
+            stop_event.set()
+        self._join_monitor_thread()
+
+        # 2. Close the executor-side MessageQueues; each worker closes its own
+        #    inside switch_model_and_topology.
+        from vllm_external_executor.mq_cleanup import close_message_queue
+
+        if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
+            close_message_queue(rpc_broadcast_mq)
+            self.rpc_broadcast_mq = None
+        for mq in getattr(self, "response_mqs", []):
+            close_message_queue(mq)
+        self.response_mqs = []
+
+        # 3. Swap config and bound actors for the new topology.
+        self.vllm_config = new_vllm_config
+        self.parallel_config = new_vllm_config.parallel_config
+        self.world_size = new_world_size
+        self.external_actors = list(new_actors)
+        self.ray_worker_handles = []
+        for i, actor in enumerate(new_actors):
+            info = ray.get(actor.get_info.remote())
+            self.ray_worker_handles.append(
+                RayWorkerHandle(
+                    actor=actor,
+                    rank=i,
+                    local_rank=-1,
+                    node_id=info["node_id"],
+                )
+            )
+
+        # 4. Rebuild MQs + re-init workers + load the new model.
+        self._init_worker_group(use_switch=True)
 
     def start_worker_monitor(self, inline=False) -> None:
         """Monitor pre-started actor liveness via heartbeat polling.

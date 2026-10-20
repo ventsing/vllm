@@ -18,7 +18,7 @@ core `parallel_state` and cannot be exercised without a device.
 | Capture trim + AOT cache | done | `mvp_entry.py` (`cudagraph_capture_sizes`, `ACL_OP_COMPILER_CACHE_MODE`) |
 | FastSwappableModelRunner (`unload`/`reload`) | done | worker `switch_model_and_topology` (unload=`_release_worker_resources`, reload=`initialize_worker`) |
 | DynamicHCCLManager (resident World Group) | dropped | rebuild ~300ms; `dynamic_hccl_manager.py` keeps only `plan_tp_partition` |
-| `switch_model_and_topology` / `reconfigure` entry | worker landed; **executor pending** | worker `switch_model_and_topology`; executor `reconfigure` next |
+| `switch_model_and_topology` / `reconfigure` entry | done | worker `switch_model_and_topology`; executor `reconfigure` + `_init_worker_group` |
 | Mooncake P2P weight zero-copy | P2, out of scope | `storage_checkpoint_engine.py` |
 
 ## Landing order
@@ -29,12 +29,14 @@ core `parallel_state` and cannot be exercised without a device.
 3. **P1 — FastSwappableModelRunner seam** (landed): worker
    `switch_model_and_topology` = stop loop → `_release_worker_resources` →
    `initialize_worker`.
-4. **P3 — executor `reconfigure`** (next): re-run `_init_executor` Steps 2-8
-   after swapping `vllm_config`/`parallel_config`/`world_size`/handles; the
-   executor closes its MQ handles and broadcasts
-   `switch_model_and_topology` instead of `initialize_worker`.
+4. **P3 — executor `reconfigure`** (landed): `_init_executor`'s worker-group
+   steps (MQ + dist init + `initialize_worker` + device + model) moved into
+   `_init_worker_group(use_switch=...)`; `reconfigure` resets leaving actors,
+   closes executor MQs, swaps `vllm_config`/`parallel_config`/`world_size`/
+   handles, then re-runs the group via
+   `switch_model_and_topology` (in-place for reused actors).
 5. **P4 — verify TP change** (1↔2↔4) on the real machine; reconcile prefill
-   capture-off knob with `vllm_ascend`.
+   capture-off knob with `vllm_ascend` and drive the end-to-end switch.
 
 ## Communication domain: rebuild, not resident
 
