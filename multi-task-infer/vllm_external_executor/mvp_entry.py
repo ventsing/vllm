@@ -289,6 +289,10 @@ def run_hot_switch_mvp(
 
     os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
     os.environ.setdefault("ACL_OP_COMPILER_CACHE_MODE", "enable")
+    # reconfigure crosses the EngineCore utility channel with a VllmConfig and
+    # Ray actor handles; the typed msgpack path can't encode those, so enable
+    # the pickle fallback on the trusted client<->EngineCore boundary.
+    os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs

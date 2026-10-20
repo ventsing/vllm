@@ -357,6 +357,10 @@ class AsyncLLM(EngineClient):
         multimodal) those are only used at init or for DP/EPLB reconfiguration,
         so this is benign.
 
+        Requires ``VLLM_ALLOW_INSECURE_SERIALIZATION=1``: the ``VllmConfig`` +
+        actor-handle payload crosses the typed msgpack utility channel, which
+        only natively encodes ``msgspec.Struct``/primitives.
+
         Raises:
             RuntimeError: If any request is still in flight client-side (the
                 rebuilt ``output_processor`` would orphan their states).

@@ -93,6 +93,13 @@ python examples/hot_switch_bench.py --capture-trim
 python examples/hot_switch_mvp.py --capture-trim
 ```
 
+> End-to-end needs `VLLM_ALLOW_INSECURE_SERIALIZATION=1`: `reconfigure` ships a
+> `VllmConfig` + Ray actor handles across the typed msgpack utility channel,
+> which only supports `msgspec.Struct`/primitives natively — the flag enables
+> the pickle fallback on the trusted client↔EngineCore boundary.
+> `run_hot_switch_mvp` sets it before constructing the engine; `hot_switch_bench`
+> does not need it (it calls `executor.reconfigure` in-process).
+
 Check against these expectations:
 
 * `init_device` (communication-domain rebuild) ≈ 300ms, not the multi-second
