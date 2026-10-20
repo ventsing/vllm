@@ -79,3 +79,23 @@ graph capture — the comm rebuild (~300ms) is not the bottleneck.
 
 Open item needing device access: the exact `vllm_ascend` flag that disables
 prefill capture.
+
+## Device verification
+
+```bash
+# 1. Raw mechanism (no scheduler): timing across TP 4 -> 2 -> 1.
+python examples/hot_switch_bench.py --capture-trim
+
+# 2. End-to-end (live AsyncLLM + EngineCore reconfigure): TP 4 -> 2 -> 1.
+python examples/hot_switch_mvp.py --capture-trim
+```
+
+Check against these expectations:
+
+* `init_device` (communication-domain rebuild) ≈ 300ms, not the multi-second
+  first handshake — confirms the "rebuild, not resident" decision.
+* `load_model` (weight load) dominates the switch; `teardown+reinit` is small.
+* No `EADDRINUSE` / port collisions across rounds (single node uses `file://`:
+  `create_dist_init_method` chooses `file://{tmp}/vllm_dist_{uuid}`).
+* TP `4→2` rank-table shrink and `2→1` both complete without re-acquiring
+  actors; `run_hot_switch_mvp` outputs valid text for every (model, tp).
