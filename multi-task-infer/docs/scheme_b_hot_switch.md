@@ -37,44 +37,29 @@ core `parallel_state` and cannot be exercised without a device.
 5. **P4 — verify TP change** (1↔2↔4) on the real machine; reconcile prefill
    capture-off knob with `vllm_ascend`.
 
-## DynamicHCCLManager design notes
+## Communication domain: rebuild, not resident
 
-Goal: `init_process_group`/`destroy_process_group` runs once per process; TP
-re-grouping becomes an in-memory `new_group` over a resident World Group.
-Lifecycle owner landed in `dynamic_hccl_manager.py` (thin; delegates to
-`vllm.distributed.parallel_state`).
+Node-local Ascend fact (real-device confirmed): once `hccl` has done its first
+handshake, each device's `hccp` process stays resident, so **destroy +
+`init_process_group` for a new topology costs ~300ms**, not the multi-second
+first-handshake cost. That removes the resident-World-Group subgroup machinery
+from the plan.
 
-- **World Group** is the torch default process group, `world_size = node
-  device count`, `rank = device id`. Created once at pool start (single node
-  uses `file://`, which owns no TCP listen socket) and destroyed only by
-  `destroy_distributed_environment()` at actor shutdown.
-- **TP sub-group** derives from `initialize_model_parallel(tp, pp)`, which
-  already does the right collective: `GroupCoordinator.__init__` iterates the
-  whole `group_ranks` partition and calls `new_group` for *every* group, so
-  every resident rank (including idle ones) participates, and each rank keeps
-  only the group containing it. No hand-rolled barrier or `split_group`
-  shim is required; the contiguous partition `[[0,1],[2,3],...]` falls out of
-  rank-ordered chunking when `rank == device id`.
-- **Teardown split** is the crux: `reset` must call `destroy_model_parallel()`
-  (TP/PP/DP/EP, keeps World) instead of `cleanup_dist_env_and_memory`, whose
-  `destroy_distributed_environment()` kills the resident World Group and the
-  torch default process group. `cleanup_dist_env_and_memory` minus the World
-  teardown is exactly `DynamicHCCLManager.release_tp_group`.
-- **Cache** keyed by `tp_size`: the partition is deterministic from World rank
-  ordering, so a repeated topology reuses the held subgroup without a fresh
-  `new_group`.
+- `switch_model_and_topology(unload)` runs the existing full teardown —
+  `cleanup_dist_env_and_memory`, which destroys both the model-parallel groups
+  and the torch default process group. That is fine: the per-round rebuild is
+  the trade-off, and it is ~300ms.
+- `reload(new_tp)` then calls `create_dist_init_method(world_size = new_tp)`
+  (single node → `file://`, no TCP port) and re-runs the normal
+  `initialize_worker` / `init_device` / `initialize_model_parallel(new_tp)`
+  path. No `gpu_worker.py` world-size decoupling is required: the default
+  group stays `TP x PP` exactly as vLLM expects.
+- The only module retained from the earlier resident-world draft is
+  `dynamic_hccl_manager.py::plan_tp_partition`, a pure contiguous-partition
+  helper (kept for neutral rank planning and future multi-node/EP).
 
-Integration (next step): pool start calls `ensure_world_group` once with
-`world_size == device count`; per task `acquire_tp_group(tp)`; reset calls
-`release_tp_group`; actor shutdown calls `teardown`. Two call sites hard-code
-``default group == TP x PP`` and must be decoupled: `gpu_worker.py` passes
-`parallel_config.world_size` (TP x PP) to `init_distributed_environment`, and
-the executor passes `world_size == TP` to `create_dist_init_method`. The
-resident World Group spans device count while `parallel_config.world_size`
-stays TP x PP for the model's own bookkeeping — closest to vLLM's DP split
-(`world_size_across_dp = device count`), which the MVP currently disables, so
-this needs a device-backed iteration rather than a blind wiring.
+Expected switch cost after this change is dominated by model weight load and
+graph capture — the comm rebuild (~300ms) is not the bottleneck.
 
-Open items needing device access: whether each carved subgroup opens its own
-HCCL communicator (vs reusing the World Group's), and the exact `vllm_ascend`
-flag that disables prefill capture.
+Open item needing device access: the exact `vllm_ascend` flag that disables
+prefill capture.
