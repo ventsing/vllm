@@ -730,6 +730,7 @@ class ExternalExecutor(RayExecutorV2):
         self.speculative_config = new_vllm_config.speculative_config
         self.observability_config = new_vllm_config.observability_config
         self.world_size = new_world_size
+        self.output_rank = self._get_output_rank()
         self.external_actors = list(new_actors)
         self.ray_worker_handles = []
         for i, actor in enumerate(new_actors):

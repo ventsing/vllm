@@ -355,7 +355,9 @@ class AsyncLLM(EngineClient):
         The engine-core *client* keeps its own ``vllm_config``/``renderer``
         references stale on purpose: under the MVP envelope (no DP / EPLB /
         multimodal) those are only used at init or for DP/EPLB reconfiguration,
-        so this is benign.
+        so this is benign. The stat ``logger_manager`` is likewise not rebuilt
+        (cosmetic: stats keep the previous model name); the tokenizer / renderer
+        / processors are rebuilt and the output loop is restarted.
 
         Requires ``VLLM_ALLOW_INSECURE_SERIALIZATION=1``: the ``VllmConfig`` +
         actor-handle payload crosses the typed msgpack utility channel, which
@@ -369,6 +371,20 @@ class AsyncLLM(EngineClient):
             raise RuntimeError(
                 "cannot reconfigure: drain in-flight requests first"
             )
+
+        # The running output_handler closed over the old output_processor and
+        # renderer by value when it started; cancel it (it is idle here because
+        # requests are drained) so the next add_request() rebuilds it against
+        # the new tokenizer/renderer.
+        handler = self.output_handler
+        if handler is not None:
+            handler.cancel()
+            try:
+                await handler
+            except asyncio.CancelledError:
+                pass
+            self.output_handler = None
+
         self.vllm_config = new_vllm_config
         self.model_config = new_vllm_config.model_config
         self.scheduler_config = new_vllm_config.scheduler_config
