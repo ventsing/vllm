@@ -19,6 +19,8 @@ core `parallel_state` and cannot be exercised without a device.
 | FastSwappableModelRunner (`unload`/`reload`) | done | worker `switch_model_and_topology` (unload=`_release_worker_resources`, reload=`initialize_worker`) |
 | DynamicHCCLManager (resident World Group) | dropped | rebuild ~300ms; `dynamic_hccl_manager.py` keeps only `plan_tp_partition` |
 | `switch_model_and_topology` / `reconfigure` entry | done | worker `switch_model_and_topology`; executor `reconfigure` + `_init_worker_group` |
+| EngineCore `reconfigure` (KV re-init + scheduler rebuild) | done | `vllm/v1/engine/core.py` (`reconfigure` + `_setup_model_specific`) |
+| End-to-end driver | done (same-tokenizer) | `mvp_entry.py::run_hot_switch_mvp` over `call_utility_async("reconfigure")` |
 | Mooncake P2P weight zero-copy | P2, out of scope | `storage_checkpoint_engine.py` |
 
 ## Landing order
@@ -35,15 +37,21 @@ core `parallel_state` and cannot be exercised without a device.
    closes executor MQs, swaps `vllm_config`/`parallel_config`/`world_size`/
    handles, then re-runs the group via
    `switch_model_and_topology` (in-place for reused actors).
-5. **P4 — on-device verify + end-to-end** (next): run
-   `examples/hot_switch_bench.py` to time the mechanism across TP `4→2→1`
-   (the executor logs teardown / `init_device` / `load_model` phases),
-   reconcile the prefill capture-off knob with `vllm_ascend`, then wire
-   EngineCore: `reconfigure` is reachable via
-   `EngineCoreClient.call_utility("reconfigure", ...)`, but a live switch
-   still needs EngineCore to re-run `_initialize_kv_caches` and rebuild
-   scheduler/input-builder/output-processor for the new model (the KV-cache
-   re-init is per-model and device-dependent — not yet landed).
+5. **P3 — EngineCore `reconfigure`** (landed): `EngineCore.__init__`'s
+   per-model setup (KV cache + scheduler + connectors + batch queue +
+   prefix-cache hasher) extracted into `_setup_model_specific`; a new
+   `EngineCore.reconfigure` swaps `vllm_config`, reconfigures the executor in
+   place, and re-runs `_setup_model_specific` (KV re-profile + capture +
+   scheduler rebuild). Reachable via `call_utility_async("reconfigure", …)`.
+6. **P3 — end-to-end driver** (landed, same-tokenizer): `run_hot_switch_mvp`
+   boots one AsyncLLM on a `max_tp` lease and reconfigures through TP
+   `1/2/4` without releasing actors.
+7. **P4 — device verify + cross-model client** (next): run
+   `examples/hot_switch_bench.py` and `run_hot_switch_mvp` on the real
+   machine (confirm `init_device` ≈ 300ms and TP 4→2 rank-shrink), reconcile
+   the prefill capture-off knob with `vllm_ascend`, and — for models with
+   *different* tokenizers — add the client-side AsyncLLM tokenizer/renderer
+   swap (the driver currently requires a shared tokenizer).
 
 ## Communication domain: rebuild, not resident
 

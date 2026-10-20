@@ -128,6 +128,7 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self._include_finished_set = include_finished_set
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
 
@@ -143,6 +144,31 @@ class EngineCore:
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
+        self._setup_model_specific()
+
+        self.aborts_queue = queue.Queue[list[str]]()
+
+        self._idle_state_callbacks: list[Callable] = []
+
+        # Mark the startup heap as static so that it's ignored by GC.
+        # Reduces pause times of oldest generation collections.
+        freeze_gc_heap()
+        # If enable, attach GC debugger after static variable freeze.
+        maybe_attach_gc_debug_callback()
+        # Enable environment variable cache (e.g. assume no more
+        # environment variable overrides after this point)
+        enable_envs_cache()
+
+    def _setup_model_specific(self) -> None:
+        """Re-run the per-model setup below the executor for ``self.vllm_config``.
+
+        Shared by :meth:`__init__` (after the executor is created) and
+        :meth:`reconfigure` (after the executor is reconfigured in place for a
+        new model/topology): profiles KV-cache memory, re-initializes the
+        workers' KV caches and rebuilds the scheduler, connectors, output
+        aggregators, batch queue and prefix-cache hasher.
+        """
+        vllm_config = self.vllm_config
         self.available_gpu_memory_for_kv_cache = -1
 
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
@@ -170,7 +196,7 @@ class EngineCore:
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
             structured_output_manager=self.structured_output_manager,
-            include_finished_set=include_finished_set,
+            include_finished_set=self._include_finished_set,
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
@@ -250,18 +276,25 @@ class EngineCore:
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
-        self.aborts_queue = queue.Queue[list[str]]()
+    def reconfigure(self, new_vllm_config: VllmConfig, new_actors: list) -> None:
+        """Hot-switch the engine to a new model/topology without a restart.
 
-        self._idle_state_callbacks: list[Callable] = []
+        The caller drains in-flight requests first (this raises while any are
+        pending). The executor is reconfigured in place — worker model /
+        communication domain / MessageQueues rebuilt, TP/PP change allowed —
+        then the per-model scheduler/KV-cache/connector setup re-runs for the
+        new config. Used over ``EngineCoreClient.call_utility("reconfigure",…)``.
+        """
+        in_flight = getattr(self.scheduler, "requests", None)
+        if in_flight:
+            raise RuntimeError(
+                f"Cannot reconfigure with {len(in_flight)} in-flight requests; "
+                "drain the scheduler first"
+            )
 
-        # Mark the startup heap as static so that it's ignored by GC.
-        # Reduces pause times of oldest generation collections.
-        freeze_gc_heap()
-        # If enable, attach GC debugger after static variable freeze.
-        maybe_attach_gc_debug_callback()
-        # Enable environment variable cache (e.g. assume no more
-        # environment variable overrides after this point)
-        enable_envs_cache()
+        self.vllm_config = new_vllm_config
+        self.model_executor.reconfigure(new_vllm_config, new_actors)
+        self._setup_model_specific()
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:

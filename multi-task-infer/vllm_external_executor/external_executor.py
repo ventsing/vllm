@@ -716,9 +716,19 @@ class ExternalExecutor(RayExecutorV2):
             close_message_queue(mq)
         self.response_mqs = []
 
-        # 3. Swap config and bound actors for the new topology.
+        # 3. Swap config and bound actors for the new topology. Mirror the
+        # derived references set by ExecutorBase.__init__ so every later
+        # executor path reads the new model's config, not the old one.
         self.vllm_config = new_vllm_config
+        self.model_config = new_vllm_config.model_config
+        self.cache_config = new_vllm_config.cache_config
+        self.lora_config = new_vllm_config.lora_config
+        self.load_config = new_vllm_config.load_config
         self.parallel_config = new_vllm_config.parallel_config
+        self.scheduler_config = new_vllm_config.scheduler_config
+        self.device_config = new_vllm_config.device_config
+        self.speculative_config = new_vllm_config.speculative_config
+        self.observability_config = new_vllm_config.observability_config
         self.world_size = new_world_size
         self.external_actors = list(new_actors)
         self.ray_worker_handles = []

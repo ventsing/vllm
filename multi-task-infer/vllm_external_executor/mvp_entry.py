@@ -232,3 +232,146 @@ def run_mvp(
         finally:
             if own_pool:
                 pool.shutdown()
+
+
+def run_hot_switch_mvp(
+    models: list[tuple[str, int]],
+    prompts: list[str],
+    *,
+    pool: object | None = None,
+    devices: list[int] | None = None,
+    max_tokens: int = 32,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    cleanup_timeout: float = 60.0,
+    warmup_distributed: bool = True,
+    cudagraph_capture_sizes: list[int] | tuple[int, ...] | None = None,
+    **engine_kwargs,
+) -> list[list[str]]:
+    """Run a sequence of ``(model, tp_size)`` over one live AsyncLLM.
+
+    Scheme-B hot switch: boots with a ``max_tp`` actor lease, then for every
+    subsequent model calls ``EngineCore.reconfigure`` through
+    ``AsyncMPClient.call_utility_async`` using the first ``tp`` actors of that
+    lease. Shrinking resets the trailing actors; growing re-initializes them in
+    place. The EngineCore process and the actor pool stay alive across the
+    whole sequence (no release -> acquire round-trip).
+
+    Client-side caveat: the *same* AsyncLLM tokenizer/renderer is reused across
+    switches, so every model must share one tokenizer (true for the same model
+    at different TP, the current 4B test). Swapping a different tokenizer on
+    the client is a separate AsyncLLM-level follow-up.
+
+    Args:
+        models: Ordered ``(model_path, tp_size)`` pairs to serve in sequence.
+        prompts: Prompts to generate from, for each model.
+        pool: Optional pre-existing :class:`ActorPoolManager` (reused, not shut
+            down on return).
+        devices: Per-node device indices; defaults to ``[0, .., max_tp)``.
+        max_tokens: Maximum tokens to generate per prompt.
+        temperature: Sampling temperature.
+        top_p: Nucleus sampling parameter.
+        cleanup_timeout: Seconds to wait for EngineCore teardown.
+        warmup_distributed: Whether to warm up NCCL/HCCl at actor creation.
+        cudagraph_capture_sizes: Decode capture sizes; None keeps vLLM default.
+        engine_kwargs: Extra ``AsyncEngineArgs`` keyword arguments.
+
+    Returns:
+        One generated-text list per model, in input order.
+
+    Raises:
+        ValueError: If ``models`` is empty or any topology is out of scope.
+    """
+    if not models:
+        raise ValueError("models must be non-empty")
+    for _, tp in models:
+        validate_mvp_config(tp, 1)
+    max_tp = max(tp for _, tp in models)
+
+    import asyncio
+
+    os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
+    os.environ.setdefault("ACL_OP_COMPILER_CACHE_MODE", "enable")
+
+    from vllm import SamplingParams
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm_external_executor import ActorPoolManager, ExternalExecutor
+
+    if cudagraph_capture_sizes is not None:
+        engine_kwargs["cudagraph_capture_sizes"] = list(cudagraph_capture_sizes)
+
+    def _config(model: str, tp: int):
+        return AsyncEngineArgs(
+            model=model,
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=1,
+            **engine_kwargs,
+        ).create_engine_config()
+
+    own_pool = pool is None
+    if own_pool:
+        if devices is None:
+            devices = list(range(max_tp))
+        pool = ActorPoolManager()
+        pool.pre_start(
+            num_actors=max_tp,
+            devices_per_node=devices,
+            warmup_distributed=warmup_distributed,
+        )
+
+    # One max-TP lease serves every topology in the sequence via prefixes.
+    actors = pool.acquire(tp_size=max_tp, pp_size=1)
+    llm = None
+    try:
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+
+        async def _generate() -> list[str]:
+            texts: list[str] = []
+            for i, prompt in enumerate(prompts):
+                final = None
+                async for output in llm.generate(
+                    prompt,
+                    sampling_params,
+                    request_id=f"hs-{i}",
+                ):
+                    final = output
+                texts.append(final.outputs[0].text if final else "")
+            return texts
+
+        async def _run() -> list[list[str]]:
+            nonlocal llm
+            first_model, first_tp = models[0]
+            llm = AsyncLLM(
+                vllm_config=_config(first_model, first_tp),
+                executor_class=ExternalExecutor,
+                log_stats=True,
+                external_actors=actors[:first_tp],
+            )
+            results = [await _generate()]
+            for model, tp in models[1:]:
+                await llm.engine_core.call_utility_async(
+                    "reconfigure", _config(model, tp), actors[:tp]
+                )
+                results.append(await _generate())
+            return results
+
+        async def _run_guarded() -> list[list[str]]:
+            try:
+                return await _run()
+            finally:
+                if llm is not None:
+                    _detach_stuck_mm_warmup(llm)
+                    await asyncio.to_thread(llm.shutdown, cleanup_timeout)
+
+        return asyncio.run(_run_guarded())
+    finally:
+        try:
+            pool.release(actors)
+        finally:
+            if own_pool:
+                pool.shutdown()
