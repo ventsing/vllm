@@ -15,25 +15,24 @@ core `parallel_state` and cannot be exercised without a device.
 | Explicit unload teardown (graph/model/KV release) | done | `external_worker_actor.py::_release_worker_resources` |
 | ZMQ reset between rounds | done | `reset()` + `_release_worker_resources` |
 | Same-world_size in-place `switch_model` | code exists, **entry gated off** | worker `switch_model`; executor `switch_model` raises `NotImplementedError` |
-| Capture trim + AOT cache | landed this turn | `mvp_entry.py` (`cudagraph_capture_sizes`, `ACL_OP_COMPILER_CACHE_MODE`) |
-| FastSwappableModelRunner (`unload`/`reload`) | missing (logic inlined) | — |
-| DynamicHCCLManager (World Group resident + sub-group split) | missing | — |
-| `switch_model_and_topology` / `reconfigure` entry | missing | — |
+| Capture trim + AOT cache | done | `mvp_entry.py` (`cudagraph_capture_sizes`, `ACL_OP_COMPILER_CACHE_MODE`) |
+| FastSwappableModelRunner (`unload`/`reload`) | done | worker `switch_model_and_topology` (unload=`_release_worker_resources`, reload=`initialize_worker`) |
+| DynamicHCCLManager (resident World Group) | dropped | rebuild ~300ms; `dynamic_hccl_manager.py` keeps only `plan_tp_partition` |
+| `switch_model_and_topology` / `reconfigure` entry | worker landed; **executor pending** | worker `switch_model_and_topology`; executor `reconfigure` next |
 | Mooncake P2P weight zero-copy | P2, out of scope | `storage_checkpoint_engine.py` |
 
 ## Landing order
 
-1. **P0 — capture trim + AOT cache** (landed): `cudagraph_capture_sizes=
-   [1,2,4,8]` + `ACL_OP_COMPILER_CACHE_MODE=enable`. Independent, verifiable
-   now on the real machine.
-2. **P1 — FastSwappableModelRunner**: extract the worker's teardown/rebuild
-   sequence (`_release_worker_resources` + `switch_model` body) into a named
-   `unload()` / `reload(new_config)` pair. No behavior change; it is the seam
-   that `switch_model_and_topology` drives.
-3. **P2 — DynamicHCCLManager**: resident global World Group + cached
-   `new_group` sub-split (details below).
-4. **P3 — `switch_model_and_topology` / `reconfigure`**: enable the executor
-   entry, wire `reset_channel → unload → get_or_create_subgroup → reload`.
+1. **P0 — capture trim + AOT cache** (landed).
+2. **P1 — comm domain** (landed): rebuild per topology, ~300ms after first
+   `hccl` handshake; no resident World Group.
+3. **P1 — FastSwappableModelRunner seam** (landed): worker
+   `switch_model_and_topology` = stop loop → `_release_worker_resources` →
+   `initialize_worker`.
+4. **P3 — executor `reconfigure`** (next): re-run `_init_executor` Steps 2-8
+   after swapping `vllm_config`/`parallel_config`/`world_size`/handles; the
+   executor closes its MQ handles and broadcasts
+   `switch_model_and_topology` instead of `initialize_worker`.
 5. **P4 — verify TP change** (1↔2↔4) on the real machine; reconcile prefill
    capture-off knob with `vllm_ascend`.
 

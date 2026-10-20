@@ -983,25 +983,70 @@ class ExternalWorkerActor:
             if output_rank is None or self._rank == output_rank:
                 WorkerProc.enqueue_output(self, e)
 
+    def _stop_worker_loop(self) -> None:
+        """Signal and join the busy loop; raises if it stays alive."""
+        self._stop_event.set()
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=10.0)
+            if self._loop_thread.is_alive():
+                raise RuntimeError(
+                    "Worker loop did not stop; refusing to free resources"
+                )
+            self._loop_thread = None
+
     def reset(self) -> None:
         """Stop execution and release task resources before returning to IDLE."""
         if self.state == ActorState.FAILED:
             raise RuntimeError("Failed actor must be rebuilt before reuse")
         self.state = ActorState.RELEASED
-        self._stop_event.set()
         try:
-            if self._loop_thread is not None:
-                self._loop_thread.join(timeout=10.0)
-                if self._loop_thread.is_alive():
-                    raise RuntimeError(
-                        "Worker loop did not stop; refusing to free resources"
-                    )
-                self._loop_thread = None
+            self._stop_worker_loop()
             self._release_worker_resources()
         except Exception as e:
             self.state = ActorState.FAILED
             raise RuntimeError(f"Actor reset failed: {e}") from e
         self.state = ActorState.IDLE
+
+    def switch_model_and_topology(
+        self,
+        vllm_config,
+        rank: int,
+        all_kwargs: list,
+        input_shm_handle,
+        is_driver_node: bool = False,
+    ) -> None:
+        """Atomically teardown and re-initialize for a new model/topology.
+
+        Bundles the multi-round ``reset`` -> ``initialize_worker`` sequence into
+        one RPC so the executor can hot-switch a resident worker without
+        releasing it back to the pool: the busy loop is stopped, the model, KV
+        cache, compiled graphs, MessageQueues and communication domain are all
+        released, then the worker is rebuilt for the new ``rank``/``all_kwargs``
+        and re-registered as LEASED. The executor drives ``init_device`` and
+        ``load_model`` over the broadcast MQ afterward, exactly as after a fresh
+        ``initialize_worker``.
+
+        On Ascend the communication-domain rebuild is ~300ms because each
+        device's ``hccp`` process is already resident, so a full teardown is
+        the accepted trade-off (no resident World Group machinery).
+        """
+        if self.state == ActorState.FAILED:
+            raise RuntimeError("Failed actor must be rebuilt before reuse")
+        try:
+            self._stop_worker_loop()
+            self._release_worker_resources()
+            self.initialize_worker(
+                vllm_config=vllm_config,
+                rank=rank,
+                all_kwargs=all_kwargs,
+                input_shm_handle=input_shm_handle,
+                is_driver_node=is_driver_node,
+            )
+        except Exception as e:
+            self.state = ActorState.FAILED
+            raise RuntimeError(
+                f"Actor switch_model_and_topology failed: {e}"
+            ) from e
 
     def _release_worker_resources(self) -> None:
         import gc
