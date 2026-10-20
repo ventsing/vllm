@@ -356,7 +356,15 @@ class AsyncLLM(EngineClient):
         references stale on purpose: under the MVP envelope (no DP / EPLB /
         multimodal) those are only used at init or for DP/EPLB reconfiguration,
         so this is benign.
+
+        Raises:
+            RuntimeError: If any request is still in flight client-side (the
+                rebuilt ``output_processor`` would orphan their states).
         """
+        if self.output_processor.has_unfinished_requests():
+            raise RuntimeError(
+                "cannot reconfigure: drain in-flight requests first"
+            )
         self.vllm_config = new_vllm_config
         self.model_config = new_vllm_config.model_config
         self.scheduler_config = new_vllm_config.scheduler_config
