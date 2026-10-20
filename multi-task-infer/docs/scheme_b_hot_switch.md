@@ -41,25 +41,35 @@ core `parallel_state` and cannot be exercised without a device.
 
 Goal: `init_process_group`/`destroy_process_group` runs once per process; TP
 re-grouping becomes an in-memory `new_group` over a resident World Group.
+Lifecycle owner landed in `dynamic_hccl_manager.py` (thin; delegates to
+`vllm.distributed.parallel_state`).
 
-- **World Group** is the default process group, `world_size = node device
-  count`, `rank = device id`. Created once at pool start (single node uses
-  `file://`, which owns no TCP listen socket). Never destroyed.
-- **TP sub-group** for a task on ranks `R` is `torch.distributed.new_group(R)`
-  over the World Group. Keyed by `tuple(sorted(R))`, cached so a reused
-  topology does not re-create.
-- **Collective constraint**: `new_group` is a collective over the *default*
-  group, so every resident actor must enter the call with the same `R`, even
-  the idle ones that will not run the model. Prefer vLLM's split-group /
-  stateless group path (`VLLM_DISTRIBUTED_USE_SPLIT_GROUP`,
-  `_init_process_group_for_split_group`, `StatelessGroupCoordinator`) which
-  exists precisely to carve sub-groups without full-world participation, over
-  hand-rolling `new_group` barriers.
-- vLLM's `initialize_model_parallel(tp, pp)` derives TP groups from the
-  default-group rank ordering (`[g0,g1],[g2,g3],...`), which matches our
-  contiguous-device requirement when `rank == device id`. The sub-split API
-  should reuse that grouping rather than re-derive it.
+- **World Group** is the torch default process group, `world_size = node
+  device count`, `rank = device id`. Created once at pool start (single node
+  uses `file://`, which owns no TCP listen socket) and destroyed only by
+  `destroy_distributed_environment()` at actor shutdown.
+- **TP sub-group** derives from `initialize_model_parallel(tp, pp)`, which
+  already does the right collective: `GroupCoordinator.__init__` iterates the
+  whole `group_ranks` partition and calls `new_group` for *every* group, so
+  every resident rank (including idle ones) participates, and each rank keeps
+  only the group containing it. No hand-rolled barrier or `split_group`
+  shim is required; the contiguous partition `[[0,1],[2,3],...]` falls out of
+  rank-ordered chunking when `rank == device id`.
+- **Teardown split** is the crux: `reset` must call `destroy_model_parallel()`
+  (TP/PP/DP/EP, keeps World) instead of `cleanup_dist_env_and_memory`, whose
+  `destroy_distributed_environment()` kills the resident World Group and the
+  torch default process group. `cleanup_dist_env_and_memory` minus the World
+  teardown is exactly `DynamicHCCLManager.release_tp_group`.
+- **Cache** keyed by `tp_size`: the partition is deterministic from World rank
+  ordering, so a repeated topology reuses the held subgroup without a fresh
+  `new_group`.
 
-Open items needing device access: whether the two-process `new_group` captures
-HCCL comm per sub-group (vs reusing the World Group communicator), and the
-exact `vllm_ascend` flag that disables prefill capture.
+Integration (next step): pool start calls `ensure_world_group` once with
+`world_size == device count`; per task `acquire_tp_group(tp)`; reset calls
+`release_tp_group`; actor shutdown calls `teardown`. The executor must stop
+passing `world_size == TP` to `create_dist_init_method` and pass the device
+count instead, so the default group spans all pool devices.
+
+Open items needing device access: whether each carved subgroup opens its own
+HCCL communicator (vs reusing the World Group's), and the exact `vllm_ascend`
+flag that disables prefill capture.
