@@ -66,9 +66,14 @@ Lifecycle owner landed in `dynamic_hccl_manager.py` (thin; delegates to
 
 Integration (next step): pool start calls `ensure_world_group` once with
 `world_size == device count`; per task `acquire_tp_group(tp)`; reset calls
-`release_tp_group`; actor shutdown calls `teardown`. The executor must stop
-passing `world_size == TP` to `create_dist_init_method` and pass the device
-count instead, so the default group spans all pool devices.
+`release_tp_group`; actor shutdown calls `teardown`. Two call sites hard-code
+``default group == TP x PP`` and must be decoupled: `gpu_worker.py` passes
+`parallel_config.world_size` (TP x PP) to `init_distributed_environment`, and
+the executor passes `world_size == TP` to `create_dist_init_method`. The
+resident World Group spans device count while `parallel_config.world_size`
+stays TP x PP for the model's own bookkeeping — closest to vLLM's DP split
+(`world_size_across_dp = device count`), which the MVP currently disables, so
+this needs a device-backed iteration rather than a blind wiring.
 
 Open items needing device access: whether each carved subgroup opens its own
 HCCL communicator (vs reusing the World Group's), and the exact `vllm_ascend`
