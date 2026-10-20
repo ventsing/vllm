@@ -35,8 +35,15 @@ core `parallel_state` and cannot be exercised without a device.
    closes executor MQs, swaps `vllm_config`/`parallel_config`/`world_size`/
    handles, then re-runs the group via
    `switch_model_and_topology` (in-place for reused actors).
-5. **P4 — verify TP change** (1↔2↔4) on the real machine; reconcile prefill
-   capture-off knob with `vllm_ascend` and drive the end-to-end switch.
+5. **P4 — on-device verify + end-to-end** (next): run
+   `examples/hot_switch_bench.py` to time the mechanism across TP `4→2→1`
+   (the executor logs teardown / `init_device` / `load_model` phases),
+   reconcile the prefill capture-off knob with `vllm_ascend`, then wire
+   EngineCore: `reconfigure` is reachable via
+   `EngineCoreClient.call_utility("reconfigure", ...)`, but a live switch
+   still needs EngineCore to re-run `_initialize_kv_caches` and rebuild
+   scheduler/input-builder/output-processor for the new model (the KV-cache
+   re-init is per-model and device-dependent — not yet landed).
 
 ## Communication domain: rebuild, not resident
 

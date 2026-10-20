@@ -317,6 +317,8 @@ class ExternalExecutor(RayExecutorV2):
         :meth:`ExternalWorkerActor.switch_model_and_topology`; otherwise the
         fresh :meth:`ExternalWorkerActor.initialize_worker` is used.
         """
+        import time
+
         import ray
         driver_node = ray.get_runtime_context().get_node_id()
 
@@ -400,6 +402,7 @@ class ExternalExecutor(RayExecutorV2):
                 node_physical_gpu_ids[node_id_0]
             )
 
+        t_worker = time.perf_counter()
         ray.get(init_worker_refs)
 
         # Step 5: Collect response MQ handles
@@ -436,8 +439,17 @@ class ExternalExecutor(RayExecutorV2):
         self.output_rank = self._get_output_rank()
 
         # RPCs run on all ranks concurrently, as required by distributed init.
+        t_device = time.perf_counter()
         self.collective_rpc("init_device")
+        t_model = time.perf_counter()
         self.collective_rpc("load_model")
+        logger.info(
+            "worker-group phases: teardown+reinit=%.3fs, "
+            "init_device=%.3fs, load_model=%.3fs",
+            t_device - t_worker,
+            t_model - t_device,
+            time.perf_counter() - t_model,
+        )
 
     def _handle_compilation_optimization(self):
         """
