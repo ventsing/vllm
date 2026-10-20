@@ -13,6 +13,7 @@ import ray
 
 from vllm_external_executor import ActorPoolManager
 from vllm_external_executor.mvp_entry import (
+    SCHEME_B_CUDAGRAPH_MODE,
     SCHEME_B_DECODE_CAPTURE_SIZES,
     run_hot_switch_mvp,
 )
@@ -40,7 +41,7 @@ def main() -> None:
     parser.add_argument(
         "--capture-trim",
         action="store_true",
-        help="Scheme B: trim decode capture to 4 slots (1,2,4,8)",
+        help="Scheme B: decode-only capture, 4 sizes (1,2,4,8)",
     )
     args = parser.parse_args()
 
@@ -69,6 +70,9 @@ def main() -> None:
             pool=pool,
             cudagraph_capture_sizes=(
                 SCHEME_B_DECODE_CAPTURE_SIZES if args.capture_trim else None
+            ),
+            cudagraph_mode=(
+                SCHEME_B_CUDAGRAPH_MODE if args.capture_trim else None
             ),
         )
         for (model, tp), texts in zip(sequence, outputs):

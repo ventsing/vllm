@@ -25,6 +25,12 @@ import os
 # fewer dummy forwards and less private graph memory per hot-switch.
 SCHEME_B_DECODE_CAPTURE_SIZES = (1, 2, 4, 8)
 
+# Scheme B also skips prefill graph capture: vLLM's v1 default
+# ``FULL_AND_PIECEWISE`` re-captures the prefill graph on every switch, so pin
+# decode-only capture. On Ascend (ACLGraph) this maps to the same
+# ``cudagraph_mode`` knob; see docs/scheme_b_hot_switch.md.
+SCHEME_B_CUDAGRAPH_MODE = "FULL_DECODE_ONLY"
+
 
 def validate_mvp_config(
     tp_size: int,
@@ -246,6 +252,7 @@ def run_hot_switch_mvp(
     cleanup_timeout: float = 60.0,
     warmup_distributed: bool = True,
     cudagraph_capture_sizes: list[int] | tuple[int, ...] | None = None,
+    cudagraph_mode: str | None = None,
     **engine_kwargs,
 ) -> list[list[str]]:
     """Run a sequence of ``(model, tp_size)`` over one live AsyncLLM.
@@ -271,6 +278,9 @@ def run_hot_switch_mvp(
         cleanup_timeout: Seconds to wait for EngineCore teardown.
         warmup_distributed: Whether to warm up NCCL/HCCl at actor creation.
         cudagraph_capture_sizes: Decode capture sizes; None keeps vLLM default.
+        cudagraph_mode: ``CompilationConfig.cudagraph_mode``; scheme B pins
+            ``"FULL_DECODE_ONLY"`` to skip prefill capture on every switch.
+            None keeps the vLLM default (``FULL_AND_PIECEWISE`` on v1).
         engine_kwargs: Extra ``AsyncEngineArgs`` keyword arguments.
 
     Returns:
@@ -301,6 +311,8 @@ def run_hot_switch_mvp(
 
     if cudagraph_capture_sizes is not None:
         engine_kwargs["cudagraph_capture_sizes"] = list(cudagraph_capture_sizes)
+    if cudagraph_mode is not None:
+        engine_kwargs["compilation_config"] = {"cudagraph_mode": cudagraph_mode}
 
     def _config(model: str, tp: int):
         return AsyncEngineArgs(

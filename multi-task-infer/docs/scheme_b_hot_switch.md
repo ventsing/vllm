@@ -53,8 +53,7 @@ core `parallel_state` and cannot be exercised without a device.
    releasing actors.
 8. **P4 — device verify** (next): run `examples/hot_switch_bench.py` and
    `examples/hot_switch_mvp.py` on the real machine — confirm `init_device`
-   ≈ 300ms, TP 4→2 rank-shrink works, and the whole switch is seconds-level —
-   and reconcile the prefill capture-off knob with `vllm_ascend`.
+   ≈ 300ms, TP 4→2 rank-shrink works, and the whole switch is seconds-level.
 
 ## Communication domain: rebuild, not resident
 
@@ -80,8 +79,16 @@ from the plan.
 Expected switch cost after this change is dominated by model weight load and
 graph capture — the comm rebuild (~300ms) is not the bottleneck.
 
-Open item needing device access: the exact `vllm_ascend` flag that disables
-prefill capture.
+Prefill capture on Ascend is not a separate flag — it rides vLLM's generic
+`CompilationConfig.cudagraph_mode` (see the [vLLM-Ascend graph-mode
+guide][ascend-graph-mode]): `NONE` = eager (no capture), `PIECEWISE` =
+prefill/mixed capture, `FULL_DECODE_ONLY` = decode-only (no prefill),
+`FULL_AND_PIECEWISE` = v1 default. Scheme B pins
+`SCHEME_B_CUDAGRAPH_MODE = "FULL_DECODE_ONLY"` so each switch skips prefill
+re-capture and only replays the trimmed decode ladder (`1,2,4,8`);
+`--capture-trim` enables both.
+
+[ascend-graph-mode]: https://raw.githubusercontent.com/vllm-project/vllm-ascend/70501212812e1e9842d74a0327c87c355268f849/docs/source/user_guide/feature_guide/graph_mode.md
 
 ## Device verification
 
