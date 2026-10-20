@@ -342,6 +342,40 @@ class AsyncLLM(EngineClient):
                 )
                 raise MaxQueuedTokensError()
 
+    async def reconfigure(self, new_vllm_config: VllmConfig, new_actors: list) -> None:
+        """Hot-switch this engine and its client to a new model/topology.
+
+        Scheme-B client entry: rebuild the client-side tokenizer / renderer /
+        input & output processors for ``new_vllm_config`` (so a *different*
+        tokenizer is handled), then delegate to :meth:`EngineCore.reconfigure`,
+        which reconfigures the executor in place (TP/PP change allowed) and
+        rebuilds the scheduler / KV cache. The caller drains in-flight requests
+        first (the engine-side switch raises while any are pending).
+
+        The engine-core *client* keeps its own ``vllm_config``/``renderer``
+        references stale on purpose: under the MVP envelope (no DP / EPLB /
+        multimodal) those are only used at init or for DP/EPLB reconfiguration,
+        so this is benign.
+        """
+        self.vllm_config = new_vllm_config
+        self.model_config = new_vllm_config.model_config
+        self.scheduler_config = new_vllm_config.scheduler_config
+        self.observability_config = new_vllm_config.observability_config
+        self.__dict__.pop("_supported_tasks", None)
+
+        self.renderer = renderer = renderer_from_config(new_vllm_config)
+        self.input_processor = InputProcessor(new_vllm_config, renderer)
+        self.output_processor = OutputProcessor(
+            renderer.tokenizer,
+            log_stats=self.log_stats,
+            stream_interval=new_vllm_config.scheduler_config.stream_interval,
+            tracing_enabled=self.observability_config.otlp_traces_endpoint is not None,
+        )
+
+        await self.engine_core.call_utility_async(
+            "reconfigure", new_vllm_config, new_actors
+        )
+
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
             # Cache the result

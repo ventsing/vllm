@@ -251,16 +251,13 @@ def run_hot_switch_mvp(
     """Run a sequence of ``(model, tp_size)`` over one live AsyncLLM.
 
     Scheme-B hot switch: boots with a ``max_tp`` actor lease, then for every
-    subsequent model calls ``EngineCore.reconfigure`` through
-    ``AsyncMPClient.call_utility_async`` using the first ``tp`` actors of that
-    lease. Shrinking resets the trailing actors; growing re-initializes them in
-    place. The EngineCore process and the actor pool stay alive across the
-    whole sequence (no release -> acquire round-trip).
-
-    Client-side caveat: the *same* AsyncLLM tokenizer/renderer is reused across
-    switches, so every model must share one tokenizer (true for the same model
-    at different TP, the current 4B test). Swapping a different tokenizer on
-    the client is a separate AsyncLLM-level follow-up.
+    subsequent model calls :meth:`AsyncLLM.reconfigure`, which rebuilds the
+    client tokenizer/renderer/processors and delegates to
+    :meth:`EngineCore.reconfigure`, using the first ``tp`` actors of the lease.
+    Shrinking resets the trailing actors; growing re-initializes them in place.
+    The EngineCore process and the actor pool stay alive across the whole
+    sequence (no release -> acquire round-trip). Distinct tokenizers are
+    supported via the client-side swap.
 
     Args:
         models: Ordered ``(model_path, tp_size)`` pairs to serve in sequence.
@@ -354,9 +351,7 @@ def run_hot_switch_mvp(
             )
             results = [await _generate()]
             for model, tp in models[1:]:
-                await llm.engine_core.call_utility_async(
-                    "reconfigure", _config(model, tp), actors[:tp]
-                )
+                await llm.reconfigure(_config(model, tp), actors[:tp])
                 results.append(await _generate())
             return results
 

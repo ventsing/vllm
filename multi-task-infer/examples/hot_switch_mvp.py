@@ -2,10 +2,9 @@
 """End-to-end scheme-B hot switch: one live AsyncLLM across TP transitions.
 
 Drives :func:`run_hot_switch_mvp`: boots on a ``max_tp`` actor lease and calls
-``EngineCore.reconfigure`` through every ``(model, tp)`` pair without releasing
-actors or recreating the EngineCore. Models must share a tokenizer (the current
-4B test does); a client-side tokenizer swap for distinct tokenizers is a
-separate follow-up.
+``AsyncLLM.reconfigure`` through every ``(model, tp)`` pair without releasing
+actors or recreating the EngineCore. Distinct tokenizers are handled by the
+client-side tokenizer/renderer swap.
 """
 
 import argparse

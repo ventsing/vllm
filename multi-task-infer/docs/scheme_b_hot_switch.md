@@ -20,7 +20,8 @@ core `parallel_state` and cannot be exercised without a device.
 | DynamicHCCLManager (resident World Group) | dropped | rebuild ~300ms; `dynamic_hccl_manager.py` keeps only `plan_tp_partition` |
 | `switch_model_and_topology` / `reconfigure` entry | done | worker `switch_model_and_topology`; executor `reconfigure` + `_init_worker_group` |
 | EngineCore `reconfigure` (KV re-init + scheduler rebuild) | done | `vllm/v1/engine/core.py` (`reconfigure` + `_setup_model_specific`) |
-| End-to-end driver | done (same-tokenizer) | `mvp_entry.py::run_hot_switch_mvp` over `call_utility_async("reconfigure")` |
+| Client tokenizer/renderer swap | done | `AsyncLLM.reconfigure` (`vllm/v1/engine/async_llm.py`) |
+| End-to-end driver | done | `mvp_entry.py::run_hot_switch_mvp` (calls `llm.reconfigure`) |
 | Mooncake P2P weight zero-copy | P2, out of scope | `storage_checkpoint_engine.py` |
 
 ## Landing order
@@ -43,15 +44,17 @@ core `parallel_state` and cannot be exercised without a device.
    `EngineCore.reconfigure` swaps `vllm_config`, reconfigures the executor in
    place, and re-runs `_setup_model_specific` (KV re-profile + capture +
    scheduler rebuild). Reachable via `call_utility_async("reconfigure", …)`.
-6. **P3 — end-to-end driver** (landed, same-tokenizer): `run_hot_switch_mvp`
-   boots one AsyncLLM on a `max_tp` lease and reconfigures through TP
-   `1/2/4` without releasing actors.
-7. **P4 — device verify + cross-model client** (next): run
-   `examples/hot_switch_bench.py` and `run_hot_switch_mvp` on the real
-   machine (confirm `init_device` ≈ 300ms and TP 4→2 rank-shrink), reconcile
-   the prefill capture-off knob with `vllm_ascend`, and — for models with
-   *different* tokenizers — add the client-side AsyncLLM tokenizer/renderer
-   swap (the driver currently requires a shared tokenizer).
+6. **P3 — client tokenizer/renderer swap** (landed): `AsyncLLM.reconfigure`
+   rebuilds `renderer`/`input_processor`/`output_processor` + config refs for
+   the new model, then delegates to `EngineCore.reconfigure` — distinct
+   tokenizers are supported.
+7. **P3 — end-to-end driver** (landed): `run_hot_switch_mvp` boots one
+   AsyncLLM on a `max_tp` lease and reconfigures through TP `1/2/4` without
+   releasing actors.
+8. **P4 — device verify** (next): run `examples/hot_switch_bench.py` and
+   `examples/hot_switch_mvp.py` on the real machine — confirm `init_device`
+   ≈ 300ms, TP 4→2 rank-shrink works, and the whole switch is seconds-level —
+   and reconcile the prefill capture-off knob with `vllm_ascend`.
 
 ## Communication domain: rebuild, not resident
 
