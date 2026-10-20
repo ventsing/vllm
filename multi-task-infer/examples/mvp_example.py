@@ -10,7 +10,10 @@ import argparse
 
 import ray
 from vllm_external_executor import ActorPoolManager
-from vllm_external_executor.mvp_entry import run_mvp
+from vllm_external_executor.mvp_entry import (
+    SCHEME_B_DECODE_CAPTURE_SIZES,
+    run_mvp,
+)
 
 PROMPTS = [
     "Hello, my name is",
@@ -32,6 +35,11 @@ def main() -> None:
     parser.add_argument("--model", action="append", help="Repeat to alternate models")
     parser.add_argument("--rounds", type=int, help="Number of sequential runs")
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--capture-trim",
+        action="store_true",
+        help="Scheme B: trim decode capture to 4 slots (1,2,4,8)",
+    )
     args = parser.parse_args()
     models = args.model or MODELS
     rounds = len(models) if args.rounds is None else args.rounds
@@ -55,6 +63,9 @@ def main() -> None:
                 tp_size=TP_SIZE,
                 pool=pool,
                 enforce_eager=args.enforce_eager,
+                cudagraph_capture_sizes=(
+                    SCHEME_B_DECODE_CAPTURE_SIZES if args.capture_trim else None
+                ),
             )
             print(f"=== round {index + 1}/{rounds}: {model} (TP={TP_SIZE}) ===")
             for prompt, text in zip(PROMPTS, outputs):

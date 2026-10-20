@@ -20,6 +20,11 @@ import os
 # Kept free of torch/ray/vllm imports so the constraint checks stay unit-testable
 # without a cluster (see tests/test_mvp_entry.py).
 
+# Scheme B trims decode graph capture to four high-frequency batch sizes
+# instead of vLLM's default ladder (1..max_num_seqs). Fewer capture sizes means
+# fewer dummy forwards and less private graph memory per hot-switch.
+SCHEME_B_DECODE_CAPTURE_SIZES = (1, 2, 4, 8)
+
 
 def validate_mvp_config(
     tp_size: int,
@@ -97,6 +102,7 @@ def run_mvp(
     kv_transfer_config: object | None = None,
     elastic_ep: bool = False,
     enable_autoscaling: bool = False,
+    cudagraph_capture_sizes: list[int] | tuple[int, ...] | None = None,
     **engine_kwargs,
 ) -> list[str]:
     """Run one model over the pooled actors and return generated texts.
@@ -121,6 +127,9 @@ def run_mvp(
         pool_size: Number of actors to pre-start; defaults to tp_size.
         cleanup_timeout: Seconds to wait for EngineCore resource teardown.
         warmup_distributed: Whether to warm up NCCL/HCCl at actor creation.
+        cudagraph_capture_sizes: Decode graph capture batch sizes. Scheme B
+            uses :data:`SCHEME_B_DECODE_CAPTURE_SIZES` to cut capture time and
+            graph memory; None keeps vLLM's default ladder.
         engine_kwargs: Extra ``AsyncEngineArgs`` keyword arguments.
 
     Returns:
@@ -144,6 +153,9 @@ def run_mvp(
     # process across many engine lifetimes, so disable telemetry before any
     # vLLM imports or child EngineCore processes are created.
     os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
+    # Ascend AOT kernel cache: reuse CANN-compiled operators across models
+    # instead of JIT-compiling them on every load (no-op on non-Ascend).
+    os.environ.setdefault("ACL_OP_COMPILER_CACHE_MODE", "enable")
 
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
@@ -164,6 +176,10 @@ def run_mvp(
     actors = pool.acquire(tp_size=tp_size, pp_size=pp_size)
     llm = None
     try:
+        if cudagraph_capture_sizes is not None:
+            engine_kwargs["cudagraph_capture_sizes"] = list(
+                cudagraph_capture_sizes
+            )
         engine_args = AsyncEngineArgs(
             model=model,
             tensor_parallel_size=tp_size,
