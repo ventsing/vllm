@@ -94,9 +94,12 @@ re-capture and only replays the trimmed decode ladder (`1,2,4,8`);
 
 ```bash
 # 1. Raw mechanism (no scheduler): timing across TP 4 -> 2 -> 1.
-python examples/hot_switch_bench.py --capture-trim
+#    (bench already pins enforce_eager=True, so it measures teardown/comm/
+#     weight-load only — no graph capture, no --capture-trim flag.)
+python examples/hot_switch_bench.py
 
 # 2. End-to-end (live AsyncLLM + EngineCore reconfigure): TP 4 -> 2 -> 1.
+#    --capture-trim = decode-only capture FULL_DECODE_ONLY + sizes (1,2,4,8).
 python examples/hot_switch_mvp.py --capture-trim
 ```
 
