@@ -245,6 +245,14 @@ class CacheConfig:
     gpu_memory_utilization. Note that kv_cache_memory_bytes
     (when not-None) ignores gpu_memory_utilization"""
 
+    skip_memory_profile: bool = False
+    """Skip the dummy-forward memory profiling run and derive ``num_gpu_blocks``
+    directly from ``kv_cache_memory_bytes`` instead. Intended for resident
+    (pooled) workers that hot-swap models: the per-model KV cache budget is
+    supplied explicitly and the 2-3s profile forward is avoided on every switch.
+    Requires ``kv_cache_memory_bytes`` to be set. Graph capture is expected to be
+    handled separately (eager or full-decode-only capture)."""
+
     kv_offloading_size: float | None = None
     """Size of the KV cache offloading buffer in GiB. When TP > 1, this is
     the total buffer size summed across all TP ranks. By default, this is set
@@ -272,6 +280,7 @@ class CacheConfig:
             # Runtime/derived knobs that don't affect compiled graph shape
             "gpu_memory_utilization",
             "kv_cache_memory_bytes",
+            "skip_memory_profile",
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",

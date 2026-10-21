@@ -536,6 +536,24 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
+        if self.cache_config.skip_memory_profile:
+            kv_cache_memory_bytes = self.cache_config.kv_cache_memory_bytes
+            if kv_cache_memory_bytes is None:
+                raise ValueError(
+                    "skip_memory_profile requires kv_cache_memory_bytes to be "
+                    "set: a static per-GPU KV cache budget in bytes."
+                )
+            logger.info(
+                "Skipping memory profiling; using kv_cache_memory_bytes=%s as "
+                "the static KV cache budget.",
+                kv_cache_memory_bytes,
+            )
+            return reserve_mm_ipc_gpu_memory(
+                kv_cache_memory_bytes,
+                self.model_config.multimodal_config,
+                getattr(self.parallel_config, "_api_process_count", 1),
+            )
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens

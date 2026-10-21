@@ -43,6 +43,19 @@ def main() -> None:
         action="store_true",
         help="Scheme B: decode-only capture, 4 sizes (1,2,4,8)",
     )
+    parser.add_argument(
+        "--skip-memory-profile",
+        action="store_true",
+        help="Skip the dummy-forward memory profile on every switch and "
+        "derive num_gpu_blocks from --kv-cache-memory-bytes instead",
+    )
+    parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        default=None,
+        help="Static per-GPU KV cache budget in bytes (required along with "
+        "--skip-memory-profile)",
+    )
     args = parser.parse_args()
 
     sequence = SEQUENCE
@@ -74,6 +87,8 @@ def main() -> None:
             cudagraph_mode=(
                 SCHEME_B_CUDAGRAPH_MODE if args.capture_trim else None
             ),
+            skip_memory_profile=args.skip_memory_profile,
+            kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         )
         for (model, tp), texts in zip(sequence, outputs):
             print(f"=== {model} (TP={tp}) ===")

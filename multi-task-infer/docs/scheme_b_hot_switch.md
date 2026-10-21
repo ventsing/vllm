@@ -110,6 +110,13 @@ python examples/hot_switch_mvp.py --capture-trim
 > `run_hot_switch_mvp` sets it before constructing the engine; `hot_switch_bench`
 > does not need it (it calls `executor.reconfigure` in-process).
 
+Phase-1 optional: `--skip-memory-profile` + `--kv-cache-memory-bytes <bytes>`
+skips the 2-3s dummy-forward memory profile on every switch and derives
+`num_gpu_blocks` from the static per-GPU budget instead. Intended for repeat
+switches where the budget is already known; pair with `--capture-trim`
+(`FULL_DECODE_ONLY`) so decode capture is handled separately, not by the
+profile run.
+
 Check against these expectations:
 
 * `init_device` (communication-domain rebuild) ≈ 300ms, not the multi-second
